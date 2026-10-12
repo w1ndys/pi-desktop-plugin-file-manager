@@ -93,7 +93,7 @@ Updated: 2026-10-12
 
 3. WHEN 规范化远程地址，系统 SHALL 去掉结尾的 `.git` 后缀与结尾的 `/`。
 4. WHEN 规范化采用 scp 形态或 `ssh://`、`git://` 形态，系统 SHALL 把协议替换为 `https://`，并 SHALL 丢弃其中的端口号（SSH 端口与 HTTPS 端口无关）。
-5. WHEN 规范化采用 `http://` 或 `https://` 形态，系统 SHALL 保留原协议与端口。
+5. WHEN 规范化采用 `http://` 或 `https://` 形态，系统 SHALL 保留原协议与端口，并 SHALL 丢弃其中的 userinfo（`user@` / `user:password@`）——`git remote get-url` 可能带回内嵌凭据，那条地址不得进入浏览器地址栏与历史。
 6. IF 远程地址含有控制字符（`U+0000`–`U+001F`、`U+007F`），系统 SHALL 拒绝该地址。
 7. IF 远程地址无法规范化成 `http://` 或 `https://` 形式的地址，系统 SHALL 以 `REMOTE_NOT_OPENABLE` 失败响应拒绝，并 SHALL 给出可读原因。
 8. IF 基点文件夹不是 git 仓库，系统 SHALL 以 `NO_REPO` 失败响应拒绝。

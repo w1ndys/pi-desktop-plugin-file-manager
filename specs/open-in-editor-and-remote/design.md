@@ -145,7 +145,7 @@ async function resolveEditorBinary() { … }
 
 **为什么不做兜底**（刻意的决策，不是遗漏）：把 `/Applications/Visual Studio Code.app/…`、`/snap/bin/code` 这类路径写死进插件，等于替用户猜他的环境；猜错时会出现「我明明改过 `PATH`，这插件还是打开了那个我已经删掉的 VS Code」这种没法解释的行为。`PATH` 是用户自己的契约，插件只读它、不绕过它。找不到时的正确做法是把话说清楚（Requirement 2.6），让用户去补 `PATH`。
 
-**Windows 上为什么必须经 `cmd.exe`**：`code.cmd` 是批处理文件，Windows 的 `CreateProcess` 不能直接执行它——`spawn(codeCmd, [path], { shell: false })` 会以 `EINVAL` 失败。所以 Windows 分支显式启动 `cmd.exe`（`process.env.ComSpec` 优先，回退 `%SystemRoot%\System32\cmd.exe`）并传 `["/d", "/s", "/c", <命令串>]`。这是对「参数不经 shell」这条不变量的**明确让步**，代价与缓解措施都在 3.2 与不变量 2 里写死了：双引号包裹（Windows 文件名不允许 `"`，引号跳不出去）、`/d` 关 AutoRun、不传 `/v` 保持 `!` 为字面量，并拒绝含 `%` 的路径。POSIX 分支完全不受影响，仍是参数数组直传。
+**Windows 上为什么必须经 `cmd.exe`**：`code.cmd` 是批处理文件，Windows 的 `CreateProcess` 不能直接执行它——`spawn(codeCmd, [path], { shell: false })` 会以 `EINVAL` 失败。所以 Windows 分支显式启动 `cmd.exe`（`process.env.ComSpec` 优先，回退 `%SystemRoot%\System32\cmd.exe`；两者都缺席就直接判 `EDITOR_UNAVAILABLE`，不猜别的解释器）并传 `["/d", "/s", "/c", "\"<命令串>\""]`，同时带上 `windowsVerbatimArguments: true`。这是对「参数不经 shell」这条不变量的**明确让步**，代价与缓解措施都在 3.2 与不变量 2 里写死了：双引号包裹、外层再加一对引号、`/d` 关 AutoRun、不传 `/v` 保持 `!` 为字面量，并拒绝含 `%` 的路径。POSIX 分支完全不受影响，仍是参数数组直传。
 
 换来的好处是 Windows **开箱可用**：VS Code 的 Windows 安装程序默认把 `...\Microsoft VS Code\bin` 加进 `PATH`，那里就有 `code.cmd`，用户不必自己改 `PATH`（这正是选 `code.cmd` 而非 `Code.exe` 的实际收益——`Code.exe` 在安装根目录、通常不在 `PATH` 上）。
 
@@ -189,10 +189,15 @@ function spawnDetached(binary, targetPath) {
   const spawn = gitSpawnFn();                     // 复用既有的惰性 require，与 git 一致
   if (!spawn) throw fail("EDITOR_UNAVAILABLE", "child processes are unavailable");
 
-  const child =
-    process.platform === "win32"
-      ? spawn(comSpecPath(), ["/d", "/s", "/c", windowsCommandLine(binary, targetPath)], WINDOWS_OPTIONS)
-      : spawn(binary, [targetPath], POSIX_OPTIONS);
+  const isWindows = process.platform === "win32";
+  // Windows 上命令串外面还要多套一层引号：cmd.exe /s 会剥掉最外层那一对。
+  const child = isWindows
+    ? spawn(comSpecPath(), ["/d", "/s", "/c", `"${windowsCommandLine(binary, targetPath)}"`], {
+        ...WINDOWS_OPTIONS,
+        // 命令行是自己拼的，必须让 libuv 原样传递，不能再按 MSVC 规则转义一遍。
+        windowsVerbatimArguments: true,
+      })
+    : spawn(binary, [targetPath], POSIX_OPTIONS);
   child.unref();
   return waitForSpawn(child);                     // 5s 超时兜底
 }
@@ -202,7 +207,7 @@ function spawnDetached(binary, targetPath) {
 
 - **复用 `resolveInsideRoot`**（L261）：它是全部通道的唯一入口守卫，已经负责规范化、根内包含、`.env*` / `.ssh` / `.pem` / `.git/**` 黑名单、symlink / junction 逃逸（realpath 双重校验）。这里传 `allowRoot: true`，因为「打开项目」的目标就是基点文件夹本身；`allowRoot` 默认 `false` 正是为了防止别的通道越权拿根。
 - **POSIX 分支原样**：`spawn(binary, [abs], { detached: true, stdio: "ignore", windowsHide: true, shell: false })` + `unref()`，参数是数组，路径里的空格、`$(…)`、反引号、换行都只是普通字符。
-- **Windows 分支的约束**：`shell: false` 仍留在 spawn 调用上（不让 Node 从参数数组拼命令串），命令串只由 `windowsCommandLine` 构造，内容就是两个双引号包裹的路径。`&`、`|`、`>`、`<`、`^` 在双引号内都是字面量；`/d` 关掉 AutoRun；不传 `/v`，延迟展开保持关闭，所以 `!` 也是字面量。唯一漏下的是 `%`，由 `isUnsafeForCmd` 提前拒掉。
+- **Windows 分支的两个必需条件**（少一个都起不来，别只做一半）：① 交进去的命令串要在「两个带引号路径」之外**再套一层引号**——`cmd.exe` 的 `/s` 规则是「命令串首字符是引号就剥掉最外层那一对」，剥完剩下的才正好是 `windowsCommandLine` 拼的那两个带引号路径；② spawn 的 options 必须带 **`windowsVerbatimArguments: true`**——否则 libuv 会按 MSVC 规则把我们已经拼好的引号再转义一遍（内嵌 `"` 变成 `\"`），而 `cmd.exe` 不认 `\"`，整条命令行会被毁掉。**注意这一条推翻了「`shell: false` 就等于命令串只由本插件构造」的直觉**：在 Windows 上 `shell: false` 只是不额外套一层 shell，argv 仍会被 libuv 重新拼成命令行，所以必须用 verbatim 关掉那层转义。`&`、`|`、`>`、`<`、`^` 在双引号内都是字面量；`/d` 关掉 AutoRun；不传 `/v`，延迟展开保持关闭，所以 `!` 也是字面量。唯一漏下的是 `%`，由 `isUnsafeForCmd` 提前拒掉。
 - **`ComSpec` 兜底**：优先取 `process.env.ComSpec`，没有时回退 `<SystemRoot>\System32\cmd.exe`；两者都拿不到就按 `EDITOR_UNAVAILABLE` 失败，不猜别的解释器。
 - **不等待进程**：`code.cmd` 自己会立刻退出（把请求转给已有实例），但即使它不退，`unref` 之后 5 秒内也一定返回。用 5 秒超时兜底：超时就判失败，但**不 kill**（进程已经交给系统了）。
 - 目标可以是文件也可以是目录：`code <dir>` 打开文件夹、`code <file>` 打开文件，都是 VS Code 的既有语义。
@@ -237,7 +242,8 @@ function normalizeRemoteUrl(raw) { … }
 | 4 | `http://` / `https://` → 原样保留协议与端口 |
 | 5 | `file://`、裸本地路径（`/`、盘符、UNC 开头）→ `notOpenable` |
 | 6 | 去掉结尾的 `/` 与结尾的 `.git` |
-| 7 | 结果必须是可解析的 `http(s)` URL 且 host 非空，否则 `notOpenable` |
+| 7 | 去掉 URL 里的 **userinfo**（`user@` / `user:password@`）：`git remote get-url` 可能带回内嵌凭据（`https://token@github.com/o/r`），那条地址一旦送进浏览器就会出现在地址栏与历史里。首页不需要凭据，整段丢掉 |
+| 8 | 结果必须是可解析的 `http(s)` URL 且 host 非空，否则 `notOpenable` |
 
 **刻意不猜平台**：不判断 host 是不是 `github.com` / `gitlab.com` / `bitbucket.org`，也不按平台生成不同的路径格式。既然链接只落到仓库首页，就不存在任何平台相关的路径拼接，自建 GitLab、Gitea、企业内网 git 全都自然可用。这是「只开首页」这个决策换来的最大简化。
 
@@ -371,7 +377,7 @@ let editorSpawn  = null;       // 懒拿的 child_process.spawn，同 gitSpawnFn
 ## Correctness Properties
 
 1. **不变量：通道只接受基点内的路径。** `handleEditorOpen` 唯一的路径来源是 `resolveInsideRoot`，它在 `allowRoot: true` 时也只放行「基点文件夹自身」，任何越界 / 凭据路径 / symlink 逃逸都会在其内部抛出，进程根本不会启动。
-2. **不变量：参数不经 shell；Windows 上经 `cmd.exe` 但引号不可逃逸。** POSIX 用 `spawn(binary, [abs], { shell: false })`，参数是数组而非字符串——条目名里的空格、`;`、`$()`、反引号、换行都不可能变成命令。Windows 上 `code.cmd` 必须经 `cmd.exe`（`CreateProcess` 不能直接执行批处理），因此改为显式构造命令串：两个路径各自双引号包裹（Windows 文件名不允许 `"`，跳不出引号），`/d` 关掉 AutoRun、不传 `/v` 保持 `!` 为字面量，并**拒绝含 `%` 的路径**（`%VAR%` 在双引号内照旧展开）。`shell: false` 在两种分支上都保留在 spawn 调用上，命令串只由本插件构造。
+2. **不变量：参数不经 shell；Windows 上经 `cmd.exe` 但引号不可逃逸。** POSIX 用 `spawn(binary, [abs], { shell: false })`，参数是数组而非字符串——条目名里的空格、`;`、`$()`、反引号、换行都不可能变成命令。Windows 上 `code.cmd` 必须经 `cmd.exe`（`CreateProcess` 不能直接执行批处理），因此改为显式构造命令串：两个路径各自双引号包裹（Windows 文件名不允许 `"`，跳不出引号），`/d` 关掉 AutoRun、不传 `/v` 保持 `!` 为字面量，并**拒绝含 `%` 的路径**（`%VAR%` 在双引号内照旧展开）。命令串之外还要多套一层引号（`cmd.exe /s` 会剥掉最外层那一对），并且 spawn 必须带 `windowsVerbatimArguments: true` —— 否则 libuv 会把已拼好的引号再转义一遍，命令行当场作废。**所以这条不变量在 Windows 上的准确表述是：命令串只由本插件的 `windowsCommandLine` 构造，且由本插件（而非 libuv）决定最终命令行文本。**
 3. **不变量：送进 `shell.openExternal` 的只能是 `http`/`https` 绝对 URL。** 由 `normalizeRemoteUrl`（要求 host 非空）与宿主白名单两道独立校验保证，任一道单独失效也拦得住。
 4. **不变量：只读。** 两个动作都不调用任何写通道；取 origin 走 `runGitCommand`，只跑 `remote get-url`，无索引写、无网络、无 `.git/**` 触碰。
 5. **幂等：** 同一次点击重复到达（菜单双击、重试）最多重复启动一次外部程序，不改变插件自己的任何状态。
@@ -416,6 +422,7 @@ let editorSpawn  = null;       // 懒拿的 child_process.spawn，同 gitSpawnFn
 - 含控制字符（`\u0000`、`\u007f`、`\n`） → `notOpenable`
 - 空串、纯 `-`、`owner/repo`（无 host） → `notOpenable`
 - `https://github.com/owner/repo?x=1#y` 这类带查询串 / 锚点 → 丢弃它们（首页不该带别人的参数）
+- **userinfo 必须丢掉**：`https://token@github.com/owner/repo.git` → `https://github.com/owner/repo`、`https://user:pass@git.internal/o/r` → `https://git.internal/o/r`（内嵌凭据不得进入浏览器地址栏与历史）。
 
 ### 层 2：视图判定
 

@@ -69,7 +69,7 @@ Feature Name: open-in-editor-and-remote
     - 多级路径（如 `group/sub/repo`）原样保留；丢弃查询串与锚点。覆盖 Requirement 4.2–4.7、5.5。
 
   - [ ] 5.2 纯函数夹具
-    - 覆盖设计文档列出的全部形态：`git@github.com:owner/repo.git`、`ssh://git@gitlab.com:2222/owner/repo.git`（端口丢弃）、`git://…`、`https://…`、`http://git.internal:8080/owner/repo.git`（协议与端口都保留）、自建 GitLab 的多级路径、结尾有无 `.git` 与 `/` 的各种组合、本地路径与 `file://`、含控制字符、空串、无 host、带查询串与锚点。覆盖 Requirement 4.2–4.7。
+    - 覆盖设计文档列出的全部形态：`git@github.com:owner/repo.git`、`ssh://git@gitlab.com:2222/owner/repo.git`（端口丢弃）、`git://…`、`https://…`、`http://git.internal:8080/owner/repo.git`（协议与端口都保留）、自建 GitLab 的多级路径、结尾有无 `.git` 与 `/` 的各种组合、本地路径与 `file://`、**含 userinfo 的地址（`https://token@github.com/o/r` 必须把 `token@` 丢掉）**、含控制字符、空串、无 host、带查询串与锚点。覆盖 Requirement 4.2–4.7。
 
   - [ ] 5.3 性质测试：只产出 `http(s)` 绝对地址（对应 Correctness Property 3）
     - 对随机生成的输入串，断言输出要么被拒绝，要么是可解析的 `http(s)` URL 且 host 非空——不可能出现其它协议。覆盖 Requirement 4.7、5.5、5.6。
@@ -145,6 +145,7 @@ Feature Name: open-in-editor-and-remote
   - [ ] 12.2 降级不牵连的回归用例（对应 Correctness Property 7）
     - 断言 `editor.binary === null`、无 git、非仓库、无 origin 这四种降级各自发生时，列目录、读写、保存、删除、搜索与 `fm.watch` 的行为与改动前一致。覆盖 Correctness Property 7。
   - [ ] 12.3 同步 README 与 CHANGELOG
+    - 另在「校验」一节写明 `verify-remote.mjs` 的 **Windows 覆盖缺口**：本功能的 Windows 分支（`cmd.exe` 剥引号 + `windowsVerbatimArguments` 那两层）**没有在真 Windows 上验证过**，只做了纯函数层面的往返断言；且假 `code.cmd` 用批处理 `echo` 记账对 `& | > < ^ %` 与换行是有损的，这些条目在 Windows 上会 SKIP。真机验证待补，别让读者以为 Windows 已经验过。
     - `README.md` 的「功能」一节补两个入口、「数据与安全」一节补 `shell.openExternal` 这次权限新增与两项动作的边界、「已知限制」一节写清三条：① 浏览器打开只落到仓库首页，不定位到具体文件；② 「用 VSCode 打开」要求 `code` 命令在 `PATH` 上，插件**不做安装位置兜底**（找不到就提示补 `PATH`，改了 `PATH` 需重新加载插件）；③ Windows 上插件调用的是 `code.cmd`，因此要经过 `cmd.exe`，含 `%` 的路径无法打开（`%VAR%` 会被展开）。
     - `CHANGELOG.md` 与 `manifest.json` 的 `changelog` 字段按仓库既有格式追加本版条目。
 
