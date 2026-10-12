@@ -2650,6 +2650,7 @@ async function resolveEditorBinary() {
   for (const dir of String(process.env.PATH ?? "").split(path.delimiter)) {
     // PATH 里的空段（连续分隔符 / 结尾分隔符）不是「当前目录」，跳过。
     if (!dir) continue;
+    // 该目录下的候选路径；命中判定见 isEditorCandidate（两个平台判的东西不一样）。
     const candidate = path.join(dir, name);
     // 命中即停并缓存；这个结论在本次插件进程里不再复核。
     if (await isEditorCandidate(candidate)) {
@@ -2681,12 +2682,14 @@ async function isEditorCandidate(candidate) {
 
 /**
  * Windows 上启动 `code.cmd` 要用的命令解释器。优先取 `ComSpec`（系统自己声明的
- * 那个）；没有它时按 `%SystemRoot%` 拼默认路径，这是 Windows 上唯一有契约保证的
- * 位置。两者都拿不到的话下面的 spawn 会失败，按 EDITOR_UNAVAILABLE 报错——不猜
- * 别的解释器，猜错就是拿用户的项目去喂一个未知程序。
+ * 那个）；没有它就按 `%SystemRoot%` 拼默认位置——这是 Windows 上唯一有契约保证的
+ * 地方。两个环境变量都缺席时返回 null：宁可报「不可用」，也不猜一个别的解释器去跑
+ * 用户的项目。
  */
 function comSpecPath() {
-  return process.env.ComSpec || path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe");
+  if (process.env.ComSpec) return process.env.ComSpec;
+  if (process.env.SystemRoot) return path.join(process.env.SystemRoot, "System32", "cmd.exe");
+  return null;
 }
 
 /**
@@ -2701,6 +2704,10 @@ function isUnsafeForCmd(targetPath) {
 /**
  * 拼交给 `cmd.exe /c` 的命令串：两个路径各自双引号包裹。
  *
+ * 注意这是**内层**形态：`cmd.exe` 的 `/s` 规则是「命令串首字符是引号就剥掉最外层那
+ * 一对」，所以真正传给 spawn 的参数要在外面再套一层引号（见 spawnDetached），剥完
+ * 剩下的正好是这里的两个带引号路径。
+ *
  * 之所以敢这么做：Windows 的文件名不允许 `"`，所以引号跳不出去；`&`、`|`、`>`、
  * `<`、`^` 在双引号内都是字面量。唯一漏下的是 `%`，由 isUnsafeForCmd 提前拦掉。
  */
@@ -2711,10 +2718,16 @@ function windowsCommandLine(codeCmdPath, targetPath) {
 /**
  * 起一个脱离插件的 code 进程并立刻返回。
  *
- * 两个分支都保留 `shell: false`：参数只走数组，绝不让 Node 从数组拼一根命令串
- * （那样 POSIX 上的空格与元字符就又变成语法了）。Windows 那个分支是刻意的让步
- * ——`code.cmd` 是批处理文件，`CreateProcess` 不能直接执行它，`shell: false`
- * 直接 spawn 会以 EINVAL 失败，只能显式启动 `cmd.exe`。
+ * POSIX 分支：参数只走数组、`shell: false`，绝不让 Node 从数组拼一根命令串（那样
+ * 空格与元字符就又变成语法了）。
+ *
+ * Windows 分支是刻意的让步：`code.cmd` 是批处理文件，`CreateProcess` 不能直接执行它，
+ * `shell: false` 直接 spawn 会以 EINVAL 失败，只能显式启动 `cmd.exe`。这里有两个必须
+ * 同时满足的条件，少一个都起不来：
+ *   ① 命令串外面再套一层引号——`cmd.exe /s` 会剥掉最外层那一对，剥完剩下的才是
+ *      「两个带引号路径」；
+ *   ② `windowsVerbatimArguments: true`——否则 libuv 会按 MSVC 规则把我们已经拼好的
+ *      引号再转义一遍（内嵌 `"` 变成 `\"`），而 cmd.exe 不认 `\"`，命令行会被毁掉。
  */
 async function spawnDetached(binary, targetPath) {
   const spawn = gitSpawnFn();
@@ -2722,18 +2735,24 @@ async function spawnDetached(binary, targetPath) {
   // 与 git 一侧同样的降级方式。
   if (!spawn) throw fail("EDITOR_UNAVAILABLE", "child processes are unavailable");
 
+  // 只有 Windows 需要先拿到命令解释器；POSIX 直接跑命中的那个可执行文件。
+  const isWindows = process.platform === "win32";
   let command;
   let args;
-  if (process.platform === "win32") {
+  if (isWindows) {
     command = comSpecPath();
+    // ComSpec 与 SystemRoot 都缺席：不猜解释器，直接说不可用。
+    if (!command) throw fail("EDITOR_UNAVAILABLE", "no command interpreter is available");
     // /d 关掉 AutoRun（注册表里的 AutoRun 会先于我们跑一遍）；
     // 刻意不传 /v，让 `!` 保持字面量（传了就是延迟展开打开）。
-    args = ["/d", "/s", "/c", windowsCommandLine(binary, targetPath)];
+    args = ["/d", "/s", "/c", `"${windowsCommandLine(binary, targetPath)}"`];
   } else {
+    // POSIX：命中什么就跑什么，参数是单元素数组，路径原样送达。
     command = binary;
     args = [targetPath];
   }
 
+  // 先声明再在 try 里赋值：这里要接住的是 spawn 的同步抛错。
   let child;
   try {
     child = spawn(command, args, {
@@ -2741,6 +2760,8 @@ async function spawnDetached(binary, targetPath) {
       stdio: "ignore",
       windowsHide: true,
       shell: false,
+      // Windows 上命令行是我们自己拼的，必须让 libuv 原样传递；POSIX 不需要这个开关。
+      windowsVerbatimArguments: isWindows,
     });
   } catch (error) {
     // spawn 同步抛出（参数类型不对之类）：折算成视图能看的失败，别让异常裸奔。
@@ -2755,25 +2776,31 @@ async function spawnDetached(binary, targetPath) {
 /**
  * 等子进程给出「起得来」或「起不来」的信号。`'spawn'` 事件算成功——目标不存在
  * （ENOENT）、没有执行权限（EACCES）这些只可能从 `'error'` 事件上来，所以不必等
- * `'close'`。超时算失败但**不 kill**：进程已经交给系统了，杀它只会杀掉一个正在
- * 打开编辑器的 code。无论成败都要清掉定时器，否则它会吊住插件进程不退出。
+ * `'close'`（code 会把请求转给已有实例后自己退出，等它反而慢）。超时算失败但
+ * **不 kill**：进程已经交给系统了，杀它只会杀掉一个正在打开编辑器的 code。
  */
 function waitForSpawn(child) {
   return new Promise((resolve, reject) => {
+    // 只认第一个到达的信号：超时与 error 会赛跑，先到的那个决定结果。
     let settled = false;
     const finish = (settle, value) => {
+      // 已经有结论就直接返回：晚到的信号不再改判（例如判超时之后 spawn 才到）。
       if (settled) return;
       settled = true;
+      // 无论成功、失败还是超时都要清掉定时器，否则它会吊住插件进程不退出。
       clearTimeout(timer);
       settle(value);
     };
 
+    // 计时器与下面两个事件共用 finish 这一个收敛点，谁先到都算数。
     const timer = setTimeout(
       () => finish(reject, fail("EDITOR_TIMEOUT", "timed out starting the code command")),
       EDITOR_TIMEOUT_MS,
     );
 
+    // 起得来：事件一到就放行，不等进程退出（它自己会把请求转给已有实例）。
     child.once("spawn", () => finish(resolve, undefined));
+    // 起不来：ENOENT / EACCES 从这里上来，交给 editorSpawnError 折算。
     child.once("error", (error) => finish(reject, editorSpawnError(error)));
   });
 }
@@ -2784,6 +2811,7 @@ function waitForSpawn(child) {
  * 归类成 INTERNAL——不把没见过的情况也说成「没装 VS Code」。
  */
 function editorSpawnError(error) {
+  // 只看 Node 给的 errno 码：靠它区分「这条命令起不来」与「其它没见过的错」。
   const code = error?.code;
   // 两种错误都只是「起不来」，对用户是同一件事：入口不可用。
   if (code === "ENOENT" || code === "EACCES") {
