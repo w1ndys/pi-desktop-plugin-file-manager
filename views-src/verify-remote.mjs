@@ -90,6 +90,13 @@ const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 /** 纯函数断言用第一份加载的实例；端到端部分每次换 PATH 都会重新加载，见 loadPlugin。 */
 const { internals } = require(pluginMain);
 
+/**
+ * main.js 用来包住登录 shell PATH 的一对标记。从 internals 取，不写死字面量：
+ * 假 shell 要按同一套标记产出，测试才不会与实现漂移。
+ */
+const MARK_START = internals.LOGIN_PATH_MARK_START;
+const MARK_END = internals.LOGIN_PATH_MARK_END;
+
 /** 本次校验自己的临时目录：假脚本、假脚本日志、临时项目都住在它下面。 */
 const base = mkdtempSync(join(tmpdir(), "pifm-remote-"));
 /** 假脚本所在的目录：唯一被塞到 PATH 最前的目录。 */
@@ -442,14 +449,59 @@ function makeHost() {
 }
 
 /**
- * 设好 PATH 后重新加载 main.js 并 onLoad，返回新实例。
+ * 把一段文本包成 shell 单引号字面量（内嵌单引号按 POSIX 规则转义）。
+ * 假 shell 要用它把 PATH 原样打印出来，免得值里的字符被 shell 解释一遍。
+ */
+function shellQuote(text) {
+  return `'${text.split("'").join("'\\''")}'`;
+}
+
+/** 假 shell 的序号：每次要一个新的就 +1，同一次运行里互不覆盖。 */
+let stubShellCount = 0;
+
+/**
+ * 造一个「假登录 shell」，顶替用户真正的那个。
+ *
+ * 为什么必须有它：探测的第二个来源是**登录 shell 的 PATH**。要是测试放着真的 SHELL 不管，
+ * 「PATH 上没有 code」这类结论就会随本机装没装 code 而变（本机 PATH 里真有
+ * `/opt/homebrew/bin/code` 就会命中），同一条断言在不同机器上时红时绿。假 shell 把这份输入
+ * 变成测试完全可控的值——它只打印一段带标记的 PATH，main.js 传的 `-ilc` 参数直接忽略。
+ */
+function makeStubShell(printedPath) {
+  stubShellCount += 1;
+  const file = join(base, `stub-shell-${stubShellCount}`);
+  // 标记文本从 internals 拿：假 shell 与 main.js 用同一对标记，测试不会与实现漂移。
+  writeFileSync(file, `#!/bin/sh\nprintf '${MARK_START}%s${MARK_END}' ${shellQuote(printedPath)}\n`);
+  chmodSync(file, 0o755);
+  return file;
+}
+
+/**
+ * 造一个内容完全自定义的假 shell（用来打 loginShellPath 的失败路径）。
+ * body 是脚本正文，调用方自己决定打印什么、退什么码、睡多久。
+ */
+function makeRawStubShell(body) {
+  stubShellCount += 1;
+  const file = join(base, `stub-shell-${stubShellCount}`);
+  writeFileSync(file, `#!/bin/sh\n${body}\n`);
+  chmodSync(file, 0o755);
+  return file;
+}
+
+/**
+ * 设好 PATH（与登录 shell 的 PATH）后重新加载 main.js 并 onLoad，返回新实例。
  *
  * 为什么必须整份重载：`editorBinary` 是模块级缓存，进程内只探测一次；想在同一次运行
  * 里换「命中 / 未命中」两种结论，只能删掉 require.cache 里的那一份再 require——新
  * 实例的模块状态是全新的，桩宿主也得重新挂一遍（旧实例仍持有旧的 pi）。
+ *
+ * shellPathValue 是「用户登录 shell 的 PATH」：默认 null = 空的（等价于这个用户 PATH 里
+ * 什么都没有，第二个来源也帮不上忙）；传字符串 = 那个用户 shell 的 PATH 长这样。
  */
-async function loadPlugin(pathValue) {
+async function loadPlugin(pathValue, shellPathValue = null) {
   process.env.PATH = pathValue;
+  // 第二个来源也一并接管：否则它会去读**真实**登录 shell 的 PATH，结论随跑测试的机器而变。
+  process.env.SHELL = makeStubShell(shellPathValue ?? "");
   delete require.cache[require.resolve(pluginMain)];
   globalThis.pi = makeHost();
   const loaded = require(pluginMain);
@@ -513,7 +565,7 @@ async function runRefusalBatch(plugin, cases) {
 
 /** 3.4 探测：命中 / 未命中 / 不做安装位置兜底。 */
 async function verifyDetection() {
-  console.log("1. 探测：只认 PATH（3.4）");
+  console.log("1. 探测：进程 PATH 优先（3.4）");
 
   // 命中：假目录排在最前，系统 PATH 接在后面。这两条也是硬闸的正面证据。
   let plugin = await loadPlugin(`${fakeDir}${delimiter}${realPath}`);
@@ -535,15 +587,89 @@ async function verifyDetection() {
   check("强行调用 → EDITOR_UNAVAILABLE", unavailable.ok === false && unavailable.code === "EDITOR_UNAVAILABLE", JSON.stringify(unavailable));
   check("提示里点名 PATH（而不是「找不到 VS Code」）", String(unavailable.message ?? "").includes("PATH"), String(unavailable.message));
 
-  // 不做兜底：只有本机确实装了 VS Code 命令行时这条才有证伪能力，没装就跳过不算失败。
-  // 判定走 hasRealVsCodeCli()：按平台扫**原始** PATH，Windows 上也能真跑，不再恒定跳过。
-  if (!hasRealVsCodeCli()) {
-    skip("本机没装 VS Code 命令行（Requirement 2.5 的唯一手段）：「不做安装位置兜底」这一条跳过");
-    return;
-  }
-  plugin = await loadPlugin("");
+  // 不做安装位置兜底：把**两个来源都清空**（进程 PATH 与假登录 shell 的 PATH），
+  // 即使本机真的装了 VS Code，也必须判为没找到。结论由假 shell 保证确定性，
+  // 不再依赖「本机装没装」——旧写法靠 hasRealVsCodeCli() 决定跳不跳，机器不同结论就不同。
+  plugin = await loadPlugin("", "");
   hello = await plugin.onPanelInvoke("fm.hello", {});
-  check("装了 VS Code 但 PATH 为空 → 仍判为没找到（没去猜安装位置）", hello.editor?.binary === null, JSON.stringify(hello));
+  check("两个 PATH 都为空 → 仍判为没找到（没去猜安装位置）", hello.editor?.binary === null, JSON.stringify(hello).slice(0, 200));
+}
+
+/*
+ * 探测的第二个来源：登录 shell 的 PATH。
+ *
+ * 为什么单独一节：macOS 从 Dock 启动的 GUI 程序拿到的是 launchd 的默认 PATH
+ * （`/usr/bin:/bin:/usr/sbin:/usr/sbin` 那一档），里面既没有 Homebrew 的
+ * `/opt/homebrew/bin` 也没有 `/usr/local/bin`，而 `code` 通常就装在那儿——只认进程 PATH
+ * 就等于让这个功能在 macOS 上默认不可用。这一节用假 shell 把「用户登录 shell 的 PATH」
+ * 变成可控输入，顺带钉住解析与失败路径（噪音、没有标记、非 0 退出、超时、输出超限）。
+ */
+async function verifyLoginShellProbe() {
+  console.log("\n1b. 登录 shell 的 PATH（第二个来源）");
+
+  // 进程 PATH 里没有 code，但用户登录 shell 的 PATH 里有 → 应当命中后者。这是本次修复的核心。
+  const fromShell = await loadPlugin(emptyDir, fakeDir);
+  const shellHello = await fromShell.onPanelInvoke("fm.hello", {});
+  check("进程 PATH 没有、登录 shell PATH 有 → 命中后者", shellHello.editor?.binary === fakeCodePath, JSON.stringify(shellHello.editor));
+
+  // 两个来源都没有：装了 VS Code 的机器上也要走通。
+  const neither = await loadPlugin(emptyDir, emptyDir);
+  const neitherHello = await neither.onPanelInvoke("fm.hello", {});
+  check("两个 PATH 都没有 code → 判为没找到", neitherHello.editor?.binary === null, JSON.stringify(neitherHello.editor));
+  // 本机装没装只作为背景信息打印，不再是跳过条件（假 shell 已经把结论钉住了）。
+  console.log(
+    hasRealVsCodeCli()
+      ? "  （本机确实装了 VS Code 命令行，上面这条「没找到」因此更有说服力）"
+      : "  （本机没装 VS Code 命令行，上面这条对本机是空转）",
+  );
+
+  // 直接打 loginShellPath 的解析与失败路径。它不缓存，可以连着调。
+  const noisy = makeRawStubShell(`printf 'loading rc...\\n'\nprintf '${MARK_START}%s${MARK_END}' '/one:/two'\nprintf 'done\\n'`);
+  process.env.SHELL = noisy;
+  const parsed = await internals.loginShellPath();
+  check("rc 横幅在标记之外 → 仍能正确取出 PATH", JSON.stringify(parsed) === JSON.stringify(["/one", "/two"]), JSON.stringify(parsed));
+
+  const noMark = makeRawStubShell(`printf '/one:/two'`);
+  process.env.SHELL = noMark;
+  check("没有标记 → null（输出不可信）", (await internals.loginShellPath()) === null);
+
+  const failExit = makeRawStubShell(`printf '${MARK_START}%s${MARK_END}' '/one:/two'\nexit 3`);
+  process.env.SHELL = failExit;
+  check("非 0 退出 → null（输出不可信）", (await internals.loginShellPath()) === null);
+
+  // 超时：用**绝对路径**的 sleep，这样既不依赖 PATH（前面几节把 PATH 换成了空目录，
+  // 写 "sleep 30" 会因找不到命令立刻非 0 退出、测的其实不是超时），也保证它既不输出、
+  // 也不自己退出——唯一的收敛途径就是超时，所以实测耗时必须接近上限。
+  const sleepy = makeRawStubShell("/bin/sleep 30");
+  process.env.SHELL = sleepy;
+  const startedAt = Date.now();
+  const timedOut = await internals.loginShellPath();
+  const elapsed = Date.now() - startedAt;
+  check("超时 → null", timedOut === null, JSON.stringify(timedOut));
+  check(
+    `超时确实等满上限才收敛（实测 ${elapsed}ms，上限 ${internals.LOGIN_SHELL_TIMEOUT_MS}ms）`,
+    elapsed >= internals.LOGIN_SHELL_TIMEOUT_MS - 300 && elapsed < internals.LOGIN_SHELL_TIMEOUT_MS + 2000,
+    `${elapsed}ms`,
+  );
+
+  // 输出超限：`/bin/cat /dev/zero` 会一直吐字节，同样不依赖 PATH、也不会自己退出。
+  // 它必须在**超时之前**被输出上限掐掉——实测耗时明显小于上限才算走对了这条路径。
+  const flood = makeRawStubShell("/bin/cat /dev/zero");
+  process.env.SHELL = flood;
+  const floodStartedAt = Date.now();
+  const flooded = await internals.loginShellPath();
+  const floodElapsed = Date.now() - floodStartedAt;
+  check("输出超限 → null（不把内存吃满）", flooded === null, JSON.stringify(flooded));
+  check(
+    `输出超限早于超时收敛（实测 ${floodElapsed}ms < 上限 ${internals.LOGIN_SHELL_TIMEOUT_MS}ms）`,
+    floodElapsed < internals.LOGIN_SHELL_TIMEOUT_MS - 500,
+    `${floodElapsed}ms`,
+  );
+
+  // SHELL 指向不存在的路径 → 回退 zsh / bash；至少不能抛错。
+  process.env.SHELL = join(base, "no-such-shell");
+  const fallback = await internals.loginShellPath();
+  check("SHELL 不存在时不抛错（回退到 zsh/bash）", fallback === null || Array.isArray(fallback), JSON.stringify(fallback)?.slice(0, 80));
 }
 
 /** 3.5 参数安全与项目根：根内逐字节送达、省略 path 落基点、越界与凭据在 spawn 前被拒。 */
@@ -1663,6 +1789,7 @@ try {
   // 所以后面几组即便整节跳过，它也已经把证据留全了（见文件头 ⑤）。
   await verifyRemoteNormalization();
   await verifyDetection();
+  await verifyLoginShellProbe();
   await verifyArgumentsAndRoot();
   await verifyInsideRootOnly();
   await verifyNoShell();
