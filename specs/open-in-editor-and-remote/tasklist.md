@@ -10,7 +10,7 @@ Feature Name: open-in-editor-and-remote
   - `HelloResponse`（L151）追加 `editor: EditorCapability`（`binary: string | null`）；`ListResponse` 追加 `remote: RemoteCapability`，并定义 `RemoteReason = "noRepo" | "noRemote" | "notOpenable" | "noGit"`。
   - 覆盖 Requirement 1、3.3、2.1、4.11；`RemoteCapability` 的可用分支带 `url` 与 `host`，不可用分支带 `reason`。
 
-- [ ] 2. manifest 的权限、版本与元数据（`manifest.json`）
+- [x] 2. manifest 的权限、版本与元数据（`manifest.json`）
   - `permissions`（L35）在 `ui.view`、`fs.read` 之后追加 `shell.openExternal`；`fs` 段（L36）保持不动，不新增 `net.domains`。覆盖 Requirement 5.1、5.2。
   - `version`（L5）由 `0.8.2` 改为 `0.9.0`（新增用户可见能力，走 minor）。
   - `i18n` 的 `en`/`zh-CN` 两份 `description` 与 `safetyNotes` 各补一段：VSCode 由插件进程自己启动、只传经根内包含校验与凭据黑名单的绝对路径（POSIX 上参数数组直传 + `shell: false`；Windows 上 `code.cmd` 必须经 `cmd.exe`，改用显式构造的双引号命令串、`/d` 关 AutoRun、不传 `/v`，并拒绝含 `%` 的路径）；浏览器打开走宿主 `shell.openExternal` 并为此新增该权限、宿主另有 http/https/mailto 白名单作为第二道闸、只送规范化后的 `http(s)` 地址；两项都不写文件、不写仓库、插件自己不发起网络请求。覆盖 Requirement 5.1–5.6。
@@ -110,6 +110,9 @@ Feature Name: open-in-editor-and-remote
     - 既有两条（`openWithDefaultApp` / `revealInFileManager`）保持不动；复用同一个错误折算惯例（`{ ok: false }` 与异常统一抛错），调用方只写一个 `catch`。覆盖 Requirement 1.1、2.4。
   - [ ] 8.2 新增 `remoteOpen.ts`，导出 `openRepoInBrowser()`
     - 单独成文件而不是塞进 `hostActions.ts`：后者的注释把「由宿主代为执行、受 `manifest.fs.read` 约束、只对文件有效」这份契约写死了，而本通道不受 `manifest.fs` 约束、也不只对文件有效。覆盖 Requirement 3.1。
+  - [ ] 8.3 修掉两处因新增 `shell.openExternal` 权限而变成假话的既有注释
+    - `views-src/src/lib/linkSafety.ts` 的文件头注释写着「本插件没有申报 shell.openExternal 权限」，`views-src/src/App.tsx` 的 `onLink` 上方注释（约 L976-977）同样这么写——任务 2 给 manifest 加上该权限之后，这两句话直接变成假话。行为不用改（`onLink` 仍只弹 toast），但理由必须重写：改成「本插件申报了 shell.openExternal，但预览里的链接仍不导航——视图一旦离开插件页面就回不来，所以点击的语义是把地址告诉用户」。
+    - 顺带在 `App.tsx` 里搜一遍是否还有别处引用「没有 shell.openExternal」这个理由，一并改掉。
 
 - [ ] 9. 视图菜单与状态（`views-src/src/App.tsx`）
   - [ ] 9.1 新增 `editorAvailable` 与 `remote` 两个状态
