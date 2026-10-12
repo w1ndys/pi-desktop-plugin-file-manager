@@ -191,7 +191,7 @@ export const COPY_TABLES = {
     openInVSCode: "Open in VS Code",
     openProjectInVSCode: "Open project in VS Code",
     editorUnavailable:
-      "The code command is not on your PATH — add VS Code's bin directory to PATH, then reload the plugin.",
+      "The code command is on neither the plugin process PATH nor your login shell PATH — add VS Code's bin directory to PATH, then reload the plugin.",
     editorOpenError: "Could not open this in VS Code.",
     editorUnsupportedPath:
       'This path cannot be opened on Windows: it contains "%", which cmd.exe would expand.',
@@ -383,7 +383,7 @@ export const COPY_TABLES = {
     externalChanged: "此文件已在磁盘上被改动，重新加载即可看到；你未保存的改动还在。",
     openInVSCode: "用 VSCode 打开",
     openProjectInVSCode: "用 VSCode 打开项目",
-    editorUnavailable: "PATH 里没有 code 命令，请把 VS Code 的命令行目录加入 PATH，然后重新加载插件。",
+    editorUnavailable: "插件进程的 PATH 与你登录 shell 的 PATH 里都没有 code 命令，请把 VS Code 的命令行目录加入 PATH，然后重新加载插件。",
     editorOpenError: "无法在 VSCode 中打开。",
     editorUnsupportedPath: "该路径含有 %，在 Windows 上会被 cmd.exe 展开，无法安全打开。",
     openRemote: "在浏览器打开仓库",

@@ -2639,33 +2639,155 @@ const EDITOR_TIMEOUT_MS = 5000;
  */
 let editorBinary;
 
+/** 探测登录 shell 的 PATH 时的等待上限（毫秒）：只跑一次，超时就杀掉那个 shell。 */
+const LOGIN_SHELL_TIMEOUT_MS = 3000;
+/** 登录 shell 输出的上限（字节）：rc 文件可能往 stdout 大吐东西，超了就直接杀掉。 */
+const LOGIN_SHELL_MAX_BYTES = 64 * 1024;
+/** 包住 PATH 的一对标记：rc 文件打印的横幅/提示落在这对标记之外，取中间那段就行。 */
+const LOGIN_PATH_MARK_START = "__PI_LOGIN_PATH__";
+const LOGIN_PATH_MARK_END = "__PI_LOGIN_PATH_END__";
+/** 交给登录 shell 的命令串。写死的常量：里面没有任何来自路径或用户的插值。 */
+const LOGIN_PATH_COMMAND = `printf '${LOGIN_PATH_MARK_START}%s${LOGIN_PATH_MARK_END}' "$PATH"`;
+
 /**
- * 在 PATH 列出的目录里找 VS Code 命令行（POSIX `code`、Windows `code.cmd`），
- * 返回命中的路径或 null。纯查找：不启动进程问 `--version`（`code` 在 macOS /
- * Linux 上就是个 shell 脚本，为了探测而启动它纯属浪费），也不看任何安装位置。
+ * 用户登录 shell 的可执行文件：`$SHELL` 优先，再试 zsh / bash，都没有返回 null。
+ * 只挑「存在的那个」（access X_OK）；不猜别的解释器，也不去读什么安装位置。
+ */
+async function resolveLoginShell() {
+  for (const candidate of [process.env.SHELL, "/bin/zsh", "/bin/bash"]) {
+    // 没配 SHELL（GUI 进程常见）或候选为空：直接看下一个候选。
+    if (!candidate) continue;
+    try {
+      await fs.access(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // 这个候选不可用（不存在 / 没执行位），继续试下一个。
+    }
+  }
+  return null;
+}
+
+/**
+ * 读用户**登录 shell** 的 PATH，返回目录数组；任何失败都返回 null。
+ *
+ * 为什么需要它：macOS 从 Dock 启动的 GUI 程序拿到的是 launchd 的默认 PATH
+ * （`/usr/bin:/bin:/usr/sbin:/sbin`），里面既没有 Homebrew 的 `/opt/homebrew/bin`
+ * 也没有 `/usr/local/bin`，而 `code` 通常就装在那儿。这不是用户没配 PATH，是插件
+ * 进程本来就看不到那份配置——所以去问一次用户自己的 shell，才叫「尊重用户的 PATH」。
+ *
+ * 注意这不是「安装位置兜底」：仍然是读 PATH，一个写死的路径都不加。
+ * 只读：起一次 shell、问一句 PATH、拿完就放走，不改配置、不碰它的 rc 文件。
+ * 用 `-ilc`（登录 + 交互）是为了同时覆盖把 brew shellenv 写在 .zprofile 与 .zshrc
+ * 的两种人；rc 文件可能打印横幅，所以 PATH 用一对标记包起来只取中间那段。
+ */
+async function loginShellPath() {
+  // Windows 的 GUI 程序正常能继承用户 PATH，不需要也不该为它去起 shell。
+  if (process.platform === "win32") return null;
+
+  const shell = await resolveLoginShell();
+  if (!shell) return null;
+  const spawn = gitSpawnFn();
+  if (!spawn) return null;
+
+  const raw = await captureCommand(spawn, shell, ["-ilc", LOGIN_PATH_COMMAND]);
+  if (raw === null) return null;
+
+  const start = raw.indexOf(LOGIN_PATH_MARK_START);
+  const end = raw.indexOf(LOGIN_PATH_MARK_END);
+  // 没有标记说明这条 shell 没按预期输出（rc 报错、被别的程序接管），输出不可信。
+  if (start < 0 || end <= start) return null;
+
+  const value = raw.slice(start + LOGIN_PATH_MARK_START.length, end);
+  // 空段（连续分隔符 / 结尾分隔符）不是「当前目录」，跳过。
+  return value.split(path.delimiter).filter((dir) => dir);
+}
+
+/**
+ * 跑一条命令、把 stdout 收成字符串；失败一律返回 null（起不来 / 超时 / 非 0 退出 /
+ * 输出超限）。与 runGit 同一套做法，只是这里不需要 stderr、也不带 git 那套环境变量。
+ * 超时与超限都要 kill：这是我们自己起的探测进程，留着就是泄漏。
+ */
+function captureCommand(spawn, command, args) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command, args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    } catch {
+      // spawn 同步抛出：当作这次探测失败，不影响调用方。
+      resolve(null);
+      return;
+    }
+
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    // 单点收敛：超时、出错、正常退出三条路都走这里，谁先到算谁，晚到的不再改结论。
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(null);
+    }, LOGIN_SHELL_TIMEOUT_MS);
+
+    child.stdout?.on("data", (chunk) => {
+      size += chunk.length;
+      // rc 文件往 stdout 吐太多：别把内存吃满，杀掉并按失败处理。
+      if (size > LOGIN_SHELL_MAX_BYTES) {
+        child.kill("SIGKILL");
+        finish(null);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    // 起不来（ENOENT / EACCES）只代表这次探测失败。
+    child.on("error", () => finish(null));
+    // 非 0 退出说明这条 shell 没正常跑完，它的输出不可信。
+    child.on("close", (code) => finish(code === 0 ? Buffer.concat(chunks).toString("utf8") : null));
+  });
+}
+
+/** 在一串目录里找候选可执行文件：命中返回绝对路径，都不命中返回 null。 */
+async function findEditorIn(dirs, name) {
+  for (const dir of dirs) {
+    // 空段（连续分隔符 / 结尾分隔符）不是「当前目录」，跳过。
+    if (!dir) continue;
+    // 该目录下的候选路径；命中判定见 isEditorCandidate（两个平台判的东西不一样）。
+    const candidate = path.join(dir, name);
+    // 命中即停并返回；缓存由调用方负责。
+    if (await isEditorCandidate(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * 找 VS Code 命令行：命中返回路径，否则 null。两个来源，**不写死任何安装位置**：
+ *   ① 插件进程自己的 PATH——正常情况在这里就命中，零额外开销；
+ *   ② 用户登录 shell 的 PATH——GUI 程序拿不到用户配置时的补救，只读（见 loginShellPath）。
+ * 结果按插件进程缓存一次（含「都没找到」这个结论），所以改了 shell 配置要重新加载插件。
  */
 async function resolveEditorBinary() {
-  // 已经探测过就直接用缓存，含「探测过但没找到」这个结论。
+  // 已经探测过就直接用缓存，含「探测过但没找到」。
   if (editorBinary !== undefined) return editorBinary;
 
   // Windows 上找 code.cmd：它是 VS Code 安装程序放进 PATH 的那一个，而 Code.exe
   // 在安装根目录、通常不在 PATH 上。大小写交给文件系统（Windows 默认不敏感）。
   const name = process.platform === "win32" ? "code.cmd" : "code";
 
-  for (const dir of String(process.env.PATH ?? "").split(path.delimiter)) {
-    // PATH 里的空段（连续分隔符 / 结尾分隔符）不是「当前目录」，跳过。
-    if (!dir) continue;
-    // 该目录下的候选路径；命中判定见 isEditorCandidate（两个平台判的东西不一样）。
-    const candidate = path.join(dir, name);
-    // 命中即停并缓存；这个结论在本次插件进程里不再复核。
-    if (await isEditorCandidate(candidate)) {
-      editorBinary = candidate;
-      return editorBinary;
-    }
+  const fromProcess = await findEditorIn(String(process.env.PATH ?? "").split(path.delimiter), name);
+  if (fromProcess) {
+    editorBinary = fromProcess;
+    return editorBinary;
   }
 
-  // 一个都没命中：判为「PATH 上没有 code」，同样缓存，别每次调用都重扫一遍。
-  editorBinary = null;
+  // 第一来源落空才起 shell：正常环境里不该为这个功能付那点启动开销。
+  const shellDirs = await loginShellPath();
+  // 登录 shell 也没拿到（或它里面也没有）：判为没找到，同样缓存。
+  editorBinary = shellDirs ? await findEditorIn(shellDirs, name) : null;
   return editorBinary;
 }
 
@@ -2842,7 +2964,7 @@ async function handleEditorOpen(payload) {
   const binary = await resolveEditorBinary();
   // message 必须点名 PATH 与 code：用户要读到的是「PATH 里没有 code 命令」而不是
   // 「找不到 VS Code」——后者会把人引向「我明明装了」的死胡同。
-  if (!binary) throw fail("EDITOR_UNAVAILABLE", "the code command is not on PATH");
+  if (!binary) throw fail("EDITOR_UNAVAILABLE", "the code command is on neither the plugin PATH nor the login shell PATH");
 
   await spawnDetached(binary, abs);
   return { ok: true, path: abs, binary };
@@ -3247,6 +3369,13 @@ module.exports = {
     // 用 VS Code 打开（0.9.0）：探测与 Windows 侧的两个纯函数，verify-remote.mjs
     // 直接断言（含 % 的路径必须被拦下；纯函数在任何平台上都能跑）。
     resolveEditorBinary,
+    // 探测的第二个来源（登录 shell 的 PATH）：verify-remote.mjs 用一个假 shell 顶替它做
+    // 确定性断言（标记解析、超时、非 0 退出），免得测试结论随本机装没装 code 而变。
+    loginShellPath,
+    LOGIN_SHELL_TIMEOUT_MS,
+    // 标记文本也要导出：假 shell 得按同一套标记产出，测试才不会与实现漂移。
+    LOGIN_PATH_MARK_START,
+    LOGIN_PATH_MARK_END,
     isUnsafeForCmd,
     windowsCommandLine,
     comSpecPath,
