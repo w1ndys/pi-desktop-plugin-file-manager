@@ -1009,6 +1009,9 @@ let gitCache = new Map();
 /** 本插件自己改过文件之后立刻作废缓存：状态必须跟着这次保存走。 */
 function invalidateGitSnapshots() {
   gitCache = new Map();
+  // origin 的判定跟着一起作废：插件自己保存 / 新建之后，下一次列表必须重新算一遍
+  // （仓库刚加了 origin、刚被删掉，都不该等满 TTL 才更新）。
+  remoteCache = new Map();
 }
 
 async function gitSnapshotFor(rootPath) {
@@ -1613,6 +1616,8 @@ async function handleList(payload) {
     truncated,
     ignoreActive: rules.length > 0,
     git: snapshot ? summarizeGit(snapshot) : { available: false },
+    // 菜单要的「能不能打开仓库首页」在这里一起给出：复用上面那个快照，不另跑 git。
+    remote: await remoteCapabilityFor(rootPath, snapshot),
   };
 }
 
@@ -3041,6 +3046,122 @@ function normalizeRemoteUrl(raw) {
   return { ok: true, url: finalUrl };
 }
 
+/*
+ * 取 origin 与「这里是不是仓库」的判定：
+ *   `git remote get-url origin` 在「不是仓库」与「没有 origin」两种情况下都是非 0 退出，
+ *   唯一的区别藏在 stderr 文案里（`fatal: not a git repository` vs `No such remote
+ *   'origin'`）。文案会随 git 版本与语言（LANG / LC_MESSAGES）变，靠它分支迟早判错，
+ *   所以成因改用一次额外的**廉价只读探测** `git rev-parse --is-inside-work-tree`：它只读
+ *   `.git` 的目录结构、不写索引、不联网，退出码就是「这里是不是工作区」这个答案。
+ *   刻意不复用 gitSnapshotFor()：那会连带跑一遍 status + diff（比一次 rev-parse 重得
+ *   多），而 `fm.remote.open` 这条路径上没有任何东西被缓存过，等于白算一遍全量状态。
+ *   只在 get-url 失败时才探测——成功路径上不多跑一个进程。
+ */
+
+/** 取一次 origin 用的输出上限：一条地址而已，4 KiB 已经远超真实长度。 */
+const MAX_REMOTE_BYTES = 4096;
+
+/**
+ * 这个文件夹在一个 git 工作区里吗？答案用于把「不是仓库」与「没有 origin」分开。
+ */
+async function isInsideWorkTree(rootPath) {
+  const probe = await runGitCommand(rootPath, ["rev-parse", "--is-inside-work-tree"], {
+    maxBytes: MAX_REMOTE_BYTES,
+  });
+  // 退出码 0 且输出恰为 `true` 才算在仓库里；其余（含被超时 kill 掉的空结果）都当作不在。
+  return probe.code === 0 && probe.stdout.toString("utf8").trim() === "true";
+}
+
+/**
+ * 基点文件夹的 origin 地址，并规范化成仓库首页；成功返回地址字符串。
+ * 按成因抛：GIT_UNAVAILABLE（没 git）/ NO_REPO（不是仓库）/ NO_REMOTE（没配 origin）/
+ * REMOTE_NOT_OPENABLE（地址打不开）——对应 design.md 3.3 那张表。
+ */
+async function remoteUrlFor(rootPath) {
+  // 只读子命令：读 `.git/config` 里的 origin，不写配置、不联网、不碰工作区。
+  const result = await runGitCommand(rootPath, ["remote", "get-url", "origin"], {
+    maxBytes: MAX_REMOTE_BYTES,
+  });
+  // 先剪尾部换行再交给规范化：git 会把地址连同换行一起打出来。
+  const raw = result.stdout.toString("utf8").trim();
+  // 非 0 退出 = 没读到 origin；空输出（例如被超时 kill 掉）同样等于没拿到。
+  if (result.code !== 0 || !raw) {
+    // 探测说不在这里：按「不是仓库」报；否则就是「有仓库、但没配 origin」。
+    if (!(await isInsideWorkTree(rootPath))) throw fail("NO_REPO", "not a git repository");
+    throw fail("NO_REMOTE", "this repository has no origin remote");
+  }
+  // 规范化：本地路径、file://、控制字符、畸形串都在这一步被判为不可打开。
+  const normalized = normalizeRemoteUrl(raw);
+  // 没通过：视图按 REMOTE_NOT_OPENABLE 给「origin 不是网页地址」这句提示。
+  if (!normalized.ok) throw fail("REMOTE_NOT_OPENABLE", "the origin remote is not a web address");
+  return normalized.url;
+}
+
+/** 取 origin 的失败码 → 视图认识的不可用原因（四种成因各对应一句不同的提示文案）。 */
+const REMOTE_REASON_BY_CODE = {
+  GIT_UNAVAILABLE: "noGit", // 这台机器上没有 git
+  NO_REPO: "noRepo", // 这个文件夹不是 git 仓库
+  NO_REMOTE: "noRemote", // 是仓库，但没有配 origin
+  REMOTE_NOT_OPENABLE: "notOpenable", // 有 origin，但不是网页地址
+};
+
+/** rootPath → { at, value }：origin 判定随 git 快照一起缓存、一起作废。 */
+let remoteCache = new Map();
+
+/**
+ * 基点文件夹能不能打开仓库首页？结果给 `fm.list` 用，所以**绝不能抛**：任何意外都
+ * 降级成「不可用 + 原因」，列目录照旧（与 git 快照「失败只等于没有状态」同一条原则）。
+ *
+ * snapshot 必须由调用方传进来（handleList 已经算过一次）：这里不跑第二个 git 快照，
+ * 而且「取 origin」这一步只在 snapshot !== null（确实是仓库）时才发起。
+ */
+async function remoteCapabilityFor(rootPath, snapshot) {
+  // 快照为 null：结论只能是下面两种，且都不必跑 git。用探测结果区分成因——「去装 git」
+  // 与「这个文件夹不是仓库」是两句完全不同的话，合并成一句「不可用」用户没法动手。
+  if (snapshot === null) {
+    return { available: false, reason: gitBinary === null ? "noGit" : "noRepo" };
+  }
+  // 是仓库才谈得上 origin：这一步要起 git 进程，所以结果按同一个 TTL 缓存，免得每次
+  // 列目录都为同一条 origin 多跑一次 git。
+  const cached = remoteCache.get(rootPath);
+  // 缓存还新鲜：直接复用，不为同一条 origin 再起一个进程。
+  if (cached && Date.now() - cached.at < GIT_SNAPSHOT_TTL_MS) return cached.value;
+  const value = await readRemoteCapability(rootPath);
+  remoteCache.set(rootPath, { at: Date.now(), value });
+  return value;
+}
+
+/** 真正去取 origin 并规范化；失败降级成原因，绝不抛（调用方是 fm.list）。 */
+async function readRemoteCapability(rootPath) {
+  try {
+    const url = await remoteUrlFor(rootPath);
+    // host 从规范化结果里读：菜单提示只要一个主机名，不为它再跑一次 git。
+    return { available: true, url, host: new URL(url).hostname };
+  } catch (error) {
+    // 认得出来的错误码照表折算；没见过的（例如 spawn 权限被拒）按「不是仓库」收口——
+    // 能走到这里说明快照非 null，git 刚才还跑得起来，所以报 noRepo 至少不会把人
+    // 引向「去装 git」这条错路。
+    return { available: false, reason: REMOTE_REASON_BY_CODE[error?.code] ?? "noRepo" };
+  }
+}
+
+/**
+ * `fm.remote.open`：把 origin 对应的仓库首页交给宿主在浏览器里打开。
+ * 只调 pi.shell.openExternal，别的什么都不做：送出去的地址只可能是 http(s)
+ * （normalizeRemoteUrl 保证过一遍），宿主侧还有 http/https/mailto 白名单作为第二道闸。
+ * 宿主拒绝（DISALLOWED_EXTERNAL_URL）或任何异常都由既有的 toFailure 折算成
+ * { ok: false, code, message }——绝不返回成功，不向视图谎称已打开。
+ */
+async function handleRemoteOpen() {
+  const root = await currentRoot();
+  // 没打开项目就没有基点文件夹可算 origin，与其它通道同一条 NO_WORKSPACE。
+  if (!root) throw fail("NO_WORKSPACE", "no project is open");
+  // 取不到 origin（非仓库 / 没配 / 不是网页地址）时这里就抛了，宿主根本不会被碰到。
+  const url = await remoteUrlFor(root.path);
+  await pi.shell.openExternal(url);
+  return { ok: true, url };
+}
+
 // ── 通道路由 ────────────────────────────────────────────────────────────────
 
 const CHANNELS = {
@@ -3061,6 +3182,7 @@ const CHANNELS = {
   "fm.git.diff": handleGitDiff,
   "fm.watch": handleWatch,
   "fm.editor.open": handleEditorOpen,
+  "fm.remote.open": handleRemoteOpen,
 };
 
 async function onPanelInvoke(channel, payload) {
@@ -3132,5 +3254,9 @@ module.exports = {
     // origin 地址规范化（0.9.0）：纯形态归一，不联网、也不判 host 属于哪家托管服务；
     // verify-remote.mjs 第 5 节用离线夹具直接断言它的输出与拒绝理由。
     normalizeRemoteUrl,
+    // 取 origin 与判定（0.9.0）：verify-remote.mjs 第 6 节用真实临时仓库直接断言
+    // 「不是仓库 / 没有 origin / 地址不可打开」三种成因与缓存随快照作废。
+    remoteUrlFor,
+    remoteCapabilityFor,
   },
 };

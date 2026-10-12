@@ -2,7 +2,7 @@
  * 用 VS Code 打开 / 在浏览器打开仓库（0.9.0）：`code` 探测、启动参数与路径守卫、
  * origin 地址规范化的离线校验。
  *
- * 五组，对应 tasklist 的 3.4 / 3.5 / 3.6 / 3.7 / 5.2 / 5.3：
+ * 六组，对应 tasklist 的 3.4 / 3.5 / 3.6 / 3.7 / 5.2 / 5.3 / 6.6 / 6.7 / 6.8：
  *   ① 探测：只认 PATH——命中（PATH 最前放一个假的 code 命令行）、未命中（PATH 指向一个
  *      不含 code 的空目录）、不做安装位置兜底（本机装了 VS Code 也照样判未找到）。
  *   ② 参数安全与项目根：根内路径逐字节送达假脚本；省略 path 落到基点文件夹；
@@ -13,6 +13,11 @@
  *   ⑤ origin 地址规范化（Requirement 4）：纯计算夹具 + 性质断言（design.md
  *      Correctness Property 3）。它不碰 PATH、不起进程，所以放在**第一个**执行：
  *      后面几组一旦因为假脚本没命中而整节跳过，这一组的证据仍然完整。
+ *   ⑥ 真实仓库（6.6 / 6.7 / 6.8）：起真的临时仓库、改它的 origin，断言 `fm.list` 的
+ *      `remote` 判定（可用 / 地址不可打开 / 没有 origin / 不是仓库 / 没有 git 五种成因
+ *      各一次）、宿主 `shell.openExternal` 收到的地址与拒绝时的失败响应，以及性质
+ *      「两个动作全程只读」（design.md Correctness Property 4）。本机没有 git 时整节跳过；
+ *      Windows 上只跳过「git 子命令记录」那一条（假 git 包装器在那边造不出来）。
  *
  * 观测手法：临时目录里写一个假的可执行脚本，它把自己收到的每个参数逐行追加到日志
  * 文件；把该目录放在 PATH 最前再加载 main.js，`resolveEditorBinary` 命中的就是它，
@@ -33,8 +38,10 @@
  * 用法：pnpm verify:remote
  */
 
-import { accessSync, chmodSync, constants, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import Module, { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -331,17 +338,72 @@ function isVsCodeCliIn(dir, fileName) {
     return false;
   }
 }
+/**
+ * 在**原始** PATH 上找真 git 的绝对路径；找不到返回 null（第 6 节整节跳过）。
+ *
+ * 为什么不用 "git" 这个名字：第 6.8 节要把一个假的 `git` 包装器挂在 PATH 最前，
+ * 测试脚本自己调 git 时必须绕过它；而且插件会把 PATH 换成桩目录，脚本若跟着用
+ * "git" 就会被自己的桩带走。绝对路径 + 模块加载时抄下的 PATH 两样都躲得开。
+ *
+ * 文件名按平台取：Windows 上真正的入口是 `git.exe`（PATH 搜索按 PATHEXT 匹配带扩展名
+ * 的文件），只找没扩展名的 `git` 会一路落空、让整节在 Windows 上白跳过。
+ */
+function findRealGit() {
+  // 平台决定候选文件名：POSIX 只有一个 `git`，Windows 是带扩展名的两个。
+  const names = process.platform === "win32" ? ["git.exe", "git.cmd"] : ["git"];
+  for (const dir of realPath.split(delimiter)) {
+    // 空片段指当前目录，跳过（与 hasRealVsCodeCli 同一条理由）。
+    if (dir === "") continue;
+    for (const name of names) {
+      const candidate = join(dir, name);
+      try {
+        // Windows 上 exe / 批处理都没有执行位，只看是不是普通文件。
+        if (process.platform === "win32") {
+          // 是普通文件就算命中；是目录的话 CreateProcess 起不来，跳过。
+          if (statSync(candidate).isFile()) return candidate;
+          continue;
+        }
+        // POSIX 靠执行位：没有执行位的那个即使存在也起不来。
+        accessSync(candidate, constants.X_OK);
+        return candidate;
+      } catch {
+        // 这个名字在这个目录里不可用，换下一个候选。
+      }
+    }
+  }
+  // 整个 PATH 都没有：调用处据此跳过第 6 节。
+  return null;
+}
+
+/** 真 git 的绝对路径；null = 原始 PATH 上没有 git。 */
+const realGit = findRealGit();
+
+/**
+ * 测试脚本自己调 git：用真 git 的绝对路径，不受插件桩 PATH 的影响。
+ * 只在第 6 节用，那时已经确认 realGit 非 null。
+ */
+const git = (cwd, args) => execFileSync(realGit, args, { cwd, encoding: "utf8" });
 
 /** 桩宿主共享的 workspace：改这里的 path 就等于换一个打开的项目。 */
 const workspace = { path: project, name: "repo" };
 /** 桩宿主共享的偏好容器；onLoad 会读它，写回时替换这个变量。 */
 let settings = { fmPrefs: {} };
 
+/** 桩宿主收到过的 `shell.openExternal` 地址（按调用次序）；每次重新加载插件时清空。 */
+let openedExternalUrls = [];
+/** 下一次 `shell.openExternal` 要不要像宿主拒绝那样抛错（6.7 的开关）。 */
+let rejectExternal = false;
+
 /**
  * 照 verify-git.mjs / verify-watch.mjs 的写法给 globalThis.pi 赋值。
- * 本次不需要 shell——「在浏览器打开」走的是 `fm.remote.open`，属于别的任务。
+ *
+ * `shell.openExternal` 是「在浏览器打开仓库」唯一的出口（6.7）：桩宿主把收到的地址
+ * 记进数组供断言，并且能按开关抛错，用来验证「宿主拒绝时通道绝不谎称成功」。
+ * 每次重新加载插件都从干净的开局开始，免得上一节的记录混进来。
  */
 function makeHost() {
+  openedExternalUrls = [];
+  rejectExternal = false;
   return {
     workspace: { get: async () => workspace },
     plugin: {
@@ -354,6 +416,18 @@ function makeHost() {
     },
     ui: { showToast: () => {} },
     fs: {},
+    shell: {
+      openExternal: async (url) => {
+        // 先记账再判是否拒绝：调用次数是「只调一次」那条断言的全部依据。
+        openedExternalUrls.push(url);
+        // 宿主侧白名单拒掉时的真实表现：抛带 DISALLOWED_EXTERNAL_URL 的错误。
+        if (rejectExternal) {
+          throw Object.assign(new Error("blocked by the host allowlist"), {
+            code: "DISALLOWED_EXTERNAL_URL",
+          });
+        }
+      },
+    },
   };
 }
 
@@ -380,9 +454,14 @@ async function loadPlugin(pathValue) {
  * 返回实例 = 可以安全调用 `fm.editor.open`；返回 null = 假脚本没被命中，此时**绝不能**
  * 再调 `fm.editor.open`——PATH 后面可能挂着用户真实的 code 命令，一调就真的在人家的机器
  * 上打开 VS Code。跳过会让这几组用例零覆盖，但比误启动安全；跳过数会进汇总行。
+ *
+ * extraDir 会插在假 code 目录之后：第 6.8 节还要把假的 `git` 包装器一起挂上，
+ * 好在「只读」这条性质上多一层「git 只被问过 remote get-url」的证据。
  */
-async function loadGuardedPlugin() {
-  const plugin = await loadPlugin(`${fakeDir}${delimiter}${realPath}`);
+async function loadGuardedPlugin(extraDir = "") {
+  // 两个桩目录都必须排在真实 PATH 之前，否则探测与 git 都会命中用户机器上真的那份。
+  const prefix = extraDir ? `${fakeDir}${delimiter}${extraDir}${delimiter}${realPath}` : `${fakeDir}${delimiter}${realPath}`;
+  const plugin = await loadPlugin(prefix);
   const hello = await plugin.onPanelInvoke("fm.hello", {});
   const binary = hello.editor?.binary;
   // 命中就是那个假脚本：放心往下走。
@@ -842,6 +921,286 @@ function verifyRemoteNormalization() {
   console.log("");
 }
 
+// ── 6. 真实仓库：remote 判定、宿主调用与「只读」性质（6.6 / 6.7 / 6.8） ─────────────
+
+/** 第 6 节的临时仓库都住在这里；假 git 包装器与它的日志放在仓库之外。 */
+const remoteBase = join(base, "remote");
+/** 假 git 包装器所在的目录：只在 6.8 挂在 PATH 上，用来记下每一次 git 子命令。 */
+const fakeGitDir = join(remoteBase, "fake-git");
+/** 假 git 的记录文件：一行一次调用（参数用空格拼起来），供「只问过 remote get-url」断言。 */
+const gitLogPath = join(remoteBase, "git-calls.log");
+
+/**
+ * 写一个假 `git`：把收到的参数追加到日志，再 `exec` 真 git 转交。
+ *
+ * 为什么要这层包装：6.8 要断言「这一段里 git 只被问过只读的 remote get-url」，而子进程
+ * 的命令行从外面看不见。`printf` 一行一个参数、`exec` 保证退出码与 stdout / stderr
+ * 原样透传，插件察觉不到中间那层。日志写在仓库之外，不会污染「仓库逐字节不变」那条断言。
+ */
+function makeFakeGit() {
+  mkdirSync(fakeGitDir, { recursive: true });
+  const scriptPath = join(fakeGitDir, "git");
+  const lines = ["#!/bin/sh", `printf '%s\\n' "$*" >> "${gitLogPath}"`, `exec "${realGit}" "$@"`, ""];
+  writeFileSync(scriptPath, lines.join("\n"));
+  // POSIX 上 spawn 靠执行位决定能不能起，脚本必须带它。
+  chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+/** 读假 git 的记录（一行一次调用）；文件还不存在就是「一次都没跑过」。 */
+function readGitCalls() {
+  try {
+    return readFileSync(gitLogPath, "utf8").split("\n").filter((line) => line !== "");
+  } catch {
+    // 日志还没生成 = 一次 git 都没跑过。
+    return [];
+  }
+}
+
+/** 起一个真仓库：一次提交、一个文件，可选配 origin（不给就留成「没有 origin」那一档）。 */
+function makeRepo(name, originUrl) {
+  const repo = join(remoteBase, name);
+  mkdirSync(repo, { recursive: true });
+  writeFileSync(join(repo, "a.txt"), "a\n");
+  git(repo, ["init", "-q", "-b", "main", "."]);
+  git(repo, ["config", "user.email", "t@example.com"]);
+  git(repo, ["config", "user.name", "t"]);
+  git(repo, ["add", "-A"]);
+  git(repo, ["commit", "-qm", "init"]);
+  // 只有给了地址才配 origin：需要「本来就没有 origin」时这一步必须缺席。
+  if (originUrl) git(repo, ["remote", "add", "origin", originUrl]);
+  return repo;
+}
+
+/** 等过 git 快照 / origin 判定的缓存 TTL：同一个目录要换结论就得等它过期。 */
+const sleepPastTtl = () => sleep(internals.GIT_SNAPSHOT_TTL_MS + 150);
+
+/** 换掉基点文件夹后列一次目录，返回响应里的 remote 判定。 */
+async function remoteOf(plugin, rootPath) {
+  // 桩宿主的 workspace 是同一个对象，改 path 就等于换一个打开的项目。
+  workspace.path = rootPath;
+  const listing = await plugin.onPanelInvoke("fm.list", { path: "" });
+  return listing.remote;
+}
+
+/**
+ * 在「这个运行时不给子进程」的条件下执行 fixture。
+ *
+ * main.js 的 gitSpawnFn 明写了这条降级路径（被裁剪的构建 / 非 Node 宿主）：拿不到
+ * spawn 时 git 一律按 GIT_UNAVAILABLE 失败、快照为 null，而 gitBinary 保持 null——
+ * 正好造出「机器上没有 git」这一幕，用来把 noGit 与 noRepo 分开。
+ * 真实机器上没法用 PATH 造这一幕：git 的兜底路径（/usr/bin/git 等）还在，libuv 会
+ * 跳过 PATH 里那个坏掉的候选继续往后找，结论就变成了「有 git、但不是仓库」。
+ * 挡的必须是整个调用窗口而不只是加载：`node:child_process` 是**惰性** require 的。
+ */
+async function withBlockedChildProcess(fixture) {
+  const originalLoad = Module._load;
+  Module._load = function blockedLoad(request, parent, isMain) {
+    // 只挡子进程能力，其余 require 原样放行。
+    if (request === "node:child_process") throw new Error("no child processes in this fixture");
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  try {
+    return await fixture();
+  } finally {
+    // 无论如何都还原：后面几节还要起真的假脚本与真的 git。
+    Module._load = originalLoad;
+  }
+}
+
+/**
+ * 把一棵目录树扫成「相对路径 → 大小:mtime:内容哈希」，用来断言调用前后逐字节不变。
+ *
+ * 三项一起比是刻意的：只比哈希会漏掉「碰了 mtime 但没改内容」，只比 mtime 会漏掉
+ * 同一秒内的改写。符号链接只记它指向哪儿、不跟进去（可能指到仓库外面）。
+ */
+function fingerprintTree(dir, prefix = "", out = new Map()) {
+  for (const dirent of readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${dirent.name}` : dirent.name;
+    const full = join(dir, dirent.name);
+    // 目录往里走。
+    if (dirent.isDirectory()) {
+      fingerprintTree(full, rel, out);
+      continue;
+    }
+    // 符号链接只记目标，不读它指向的内容。
+    if (dirent.isSymbolicLink()) {
+      out.set(rel, `link:${readlinkSync(full)}`);
+      continue;
+    }
+    const stat = statSync(full);
+    out.set(rel, `${stat.size}:${stat.mtimeMs}:${createHash("sha256").update(readFileSync(full)).digest("hex")}`);
+  }
+  return out;
+}
+
+/** 两份指纹的第一处差异；没有差异返回 null（照 cmdBookkeepingBlocker 的 null = 无事约定）。 */
+function firstDifference(before, after) {
+  for (const key of new Set([...before.keys(), ...after.keys()])) {
+    // 有一侧没有这个键（新增 / 删除）或值不同 = 就是这一处，报出来即可。
+    if (before.get(key) !== after.get(key)) return `${key}: ${before.get(key)} → ${after.get(key)}`;
+  }
+  return null;
+}
+
+/**
+ * 问一次工作区状态。
+ * 带 `GIT_OPTIONAL_LOCKS=0`：`git status` 默认会顺手刷新索引，那本身就是一次写；
+ * 这条性质要证明「被检的调用没写」，那么用来提问的工具自己先不能写。
+ */
+const gitStatusOf = (repo) => execFileSync(realGit, ["status", "--porcelain"], { cwd: repo, encoding: "utf8", env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } });
+
+/** 6.6 真实仓库的五种判定：可用 / 地址不可打开 / 没有 origin / 不是仓库 / 没有 git。 */
+async function verifyRemoteCapability() {
+  console.log("\n6. 真实仓库的 remote 判定（6.6）");
+
+  // 可用：配了 scp 形态的 origin，列表就该给出规范化后的首页与主机名。
+  const repo = makeRepo("capability", "git@github.com:owner/repo.git");
+  const plugin = await loadPlugin(realPath);
+  const available = await remoteOf(plugin, repo);
+  check("配了 scp 形态 origin → available: true", available?.available === true, JSON.stringify(available));
+  check("url 是规范化后的仓库首页", available?.url === "https://github.com/owner/repo", JSON.stringify(available));
+  check("host 是解析出来的主机名（不为它另跑 git）", available?.host === "github.com", JSON.stringify(available));
+
+  // 缓存：TTL 内 origin 改了仍读到旧结论——这正是「不为每条 entry 重算」换来的代价。
+  git(repo, ["remote", "set-url", "origin", repo]);
+  const cached = await remoteOf(plugin, repo);
+  check("TTL 内 origin 已变仍返回缓存结论（2s 缓存生效）", cached?.available === true, JSON.stringify(cached));
+  await sleepPastTtl();
+  const notOpenable = await remoteOf(plugin, repo);
+  check("origin 是本地路径 → notOpenable", notOpenable?.reason === "notOpenable", JSON.stringify(notOpenable));
+
+  // 插件自己写过文件之后必须立刻重算：invalidateGitSnapshots() 连 origin 判定一起清。
+  // 这里用 fm.write（保存）而不是 fm.create：保存同样会作废缓存，而 fm.create / fm.rename
+  // 在本仓 HEAD 上有一个与本次改动无关的既有故障（见 main.js 的 assertValidName），
+  // 拿它当夹具会把一个别人的 bug 混进这一节。该故障已单独报告，未在本任务里修。
+  git(repo, ["remote", "set-url", "origin", "https://git.internal:8080/owner/repo.git"]);
+  const saved = await plugin.onPanelInvoke("fm.write", { path: "a.txt", text: "a\nsaved\n" });
+  check("插件自己保存文件成功（这一步会作废缓存）", saved.ok === true, JSON.stringify(saved));
+  // 关键：保存之后**立刻**列目录就必须是新结论，不用等 TTL 到期。
+  const afterWrite = await remoteOf(plugin, repo);
+  check("插件写完之后立刻重算，不等 TTL 到期", afterWrite?.available === true && afterWrite.url === "https://git.internal:8080/owner/repo", JSON.stringify(afterWrite));
+
+  // 没有 origin：删掉之后再等过 TTL，结论必须跟着变，通道也给出 NO_REMOTE。
+  git(repo, ["remote", "remove", "origin"]);
+  await sleepPastTtl();
+  const noRemote = await remoteOf(plugin, repo);
+  check("删掉 origin → noRemote", noRemote?.reason === "noRemote", JSON.stringify(noRemote));
+  const openNoRemote = await plugin.onPanelInvoke("fm.remote.open", {});
+  check("没有 origin 时打开 → NO_REMOTE", openNoRemote.ok === false && openNoRemote.code === "NO_REMOTE", JSON.stringify(openNoRemote));
+
+  // 不是仓库：换一个普通文件夹当基点。
+  const plain = join(remoteBase, "plain");
+  mkdirSync(plain, { recursive: true });
+  const noRepo = await remoteOf(plugin, plain);
+  check("非仓库目录 → noRepo", noRepo?.reason === "noRepo", JSON.stringify(noRepo));
+  const openNoRepo = await plugin.onPanelInvoke("fm.remote.open", {});
+  check("非仓库目录打开 → NO_REPO", openNoRepo.ok === false && openNoRepo.code === "NO_REPO", JSON.stringify(openNoRepo));
+  // 地址不可打开：换一个 origin 指向本地路径的仓库（本地路径绝不能被读成 host）。
+  const localRepo = makeRepo("capability-local", repo);
+  const localCapability = await remoteOf(plugin, localRepo);
+  check("origin 指向本地路径 → notOpenable", localCapability?.reason === "notOpenable", JSON.stringify(localCapability));
+  const openLocal = await plugin.onPanelInvoke("fm.remote.open", {});
+  check("本地路径 origin 打开 → REMOTE_NOT_OPENABLE", openLocal.ok === false && openLocal.code === "REMOTE_NOT_OPENABLE", JSON.stringify(openLocal));
+
+  // 没有 git：整段调用都跑在「没有子进程能力」的窗口里，git 探测必然失败。
+  const blocked = await withBlockedChildProcess(async () => {
+    const instance = await loadPlugin(realPath);
+    return { verdict: await remoteOf(instance, plain), open: await instance.onPanelInvoke("fm.remote.open", {}) };
+  });
+  check("机器上没有 git → noGit（与 noRepo 分开）", blocked.verdict?.reason === "noGit", JSON.stringify(blocked.verdict));
+  check("没有 git 时打开 → GIT_UNAVAILABLE", blocked.open.ok === false && blocked.open.code === "GIT_UNAVAILABLE", JSON.stringify(blocked.open));
+}
+
+/** 6.7 宿主调用与拒绝：地址恰好等于规范化结果、只调一次、拒绝时不谎称成功。 */
+async function verifyRemoteOpen() {
+  console.log("\n6. 宿主调用与拒绝（6.7）");
+
+  const repo = makeRepo("open", "git@github.com:owner/repo.git");
+  const plugin = await loadPlugin(realPath);
+  workspace.path = repo;
+
+  openedExternalUrls = [];
+  const opened = await plugin.onPanelInvoke("fm.remote.open", {});
+  check("成功返回 { ok: true, url }", opened.ok === true && opened.url === "https://github.com/owner/repo", JSON.stringify(opened));
+  check("宿主收到的地址恰好等于规范化结果、且只收了一次", openedExternalUrls.length === 1 && openedExternalUrls[0] === opened.url, JSON.stringify(openedExternalUrls));
+
+  // 目标无关（Requirement 3.4）：从文件上请求，落到的是同一个仓库首页。
+  openedExternalUrls = [];
+  const fromFile = await plugin.onPanelInvoke("fm.remote.open", { path: "a.txt" });
+  check("从文件上请求打开发的是同一个仓库首页", fromFile.ok === true && fromFile.url === opened.url, JSON.stringify(fromFile));
+  check("这一次也只调了宿主一次", openedExternalUrls.length === 1 && openedExternalUrls[0] === opened.url, JSON.stringify(openedExternalUrls));
+
+  // 宿主拒绝：桩宿主像宿主白名单那样抛 DISALLOWED_EXTERNAL_URL。
+  openedExternalUrls = [];
+  rejectExternal = true;
+  const refused = await plugin.onPanelInvoke("fm.remote.open", {});
+  check("宿主拒绝 → { ok: false }，绝不谎称成功", refused.ok === false, JSON.stringify(refused));
+  check("拒绝原因由宿主原样透传", refused.code === "DISALLOWED_EXTERNAL_URL", JSON.stringify(refused));
+  check("拒绝前确实调过宿主（不是压根没尝试）", openedExternalUrls.length === 1, JSON.stringify(openedExternalUrls));
+}
+
+/**
+ * 6.8 性质：两个动作全程只读（design.md Correctness Property 4）。
+ *
+ * 三层证据：① 仓库整棵树（大小 + mtime + 内容哈希）逐项不变、且没多出 index.lock；
+ * ② `git status --porcelain` 前后一致；③ 假 git 记下的调用只有 `remote get-url`。
+ */
+async function verifyReadOnlyActions() {
+  console.log("\n6. 性质：两个动作全程只读（6.8）");
+  // 假 git 包装器只在 POSIX 上造得出来：Windows 的 PATH 搜索按 PATHEXT 匹配带扩展名的
+  // 文件，一个没扩展名的 `git` 不会被选中，批处理包装器又没法原样透传退出码与输出。
+  // 造不出来时只跳过「git 子命令」那一条证据，逐字节不变与索引锁照常断言。
+  const instrumentGit = process.platform !== "win32";
+  // 假 git 包装器：挂上之后这一段里每一次 git 调用都会被记下来。
+  if (instrumentGit) makeFakeGit();
+  // 硬闸：这一节要真启动假 code 脚本（POSIX 上假 git 与它一起排在真实 PATH 之前）。
+  const plugin = await loadGuardedPlugin(instrumentGit ? fakeGitDir : "");
+  // 假脚本没被命中：整节跳过，避免打到用户机器上真的 code（与第 2 / 3 / 4 节同一道硬闸）。
+  if (!plugin) return;
+
+  const repo = makeRepo("readonly", "git@github.com:owner/repo.git");
+  mkdirSync(join(repo, "sub"), { recursive: true });
+  writeFileSync(join(repo, "sub", "b.txt"), "b\n");
+  workspace.path = repo;
+  // 日志与指纹都从这一刻算起，且 git 的调用记录必须先清零。
+  if (instrumentGit) writeFileSync(gitLogPath, "");
+  const codeLogBefore = readLog().length;
+  const statusBefore = gitStatusOf(repo);
+  const before = fingerprintTree(repo);
+
+  // 三轮：空 path（基点自身）、文件、子目录都走到，两条通道各一次。
+  const targets = ["", "a.txt", "sub/b.txt"];
+  for (let round = 0; round < targets.length; round += 1) {
+    const opened = await plugin.onPanelInvoke("fm.remote.open", {});
+    check(`第 ${round + 1} 轮 fm.remote.open 成功`, opened.ok === true, JSON.stringify(opened));
+    const edited = await plugin.onPanelInvoke("fm.editor.open", { path: targets[round] });
+    check(`第 ${round + 1} 轮 fm.editor.open 成功`, edited.ok === true, JSON.stringify(edited));
+  }
+  // 假脚本写日志是异步的：等它写完再比（与前面几节同一手法，有硬上限）。
+  await waitForLogGrowth(codeLogBefore);
+
+  const statusAfter = gitStatusOf(repo);
+  const after = fingerprintTree(repo);
+  const difference = firstDifference(before, after);
+  check("工作区与 .git 在调用前后逐字节不变（大小 + mtime + 内容哈希）", difference === null, String(difference));
+  check("没有留下索引锁（.git/index.lock）", !existsSync(join(repo, ".git", "index.lock")), "index.lock 出现了");
+  check("git status --porcelain 前后一致（没多出任何改动）", statusBefore === statusAfter, `${JSON.stringify(statusBefore)} → ${JSON.stringify(statusAfter)}`);
+  check("两条动作确实执行过（否则这条性质是空转）", readLog().length > codeLogBefore, "假 code 一次都没被调用");
+  // 这个平台上没挂假 git：这一条证据（只问过哪些子命令）没法取，但跳过要看得见。
+  if (!instrumentGit) {
+    skip("git 子命令记录（只跑 remote get-url）：Windows 上造不出可用的假 git");
+    return;
+  }
+  // 只读的正面证据：这一段里 git 只被问过 remote get-url 这一条只读子命令。
+  const calls = readGitCalls();
+  check(
+    `这一段里 git 只跑了 remote get-url（共 ${calls.length} 次）`,
+    calls.length === targets.length && calls.every((line) => line === "remote get-url origin"),
+    JSON.stringify(calls),
+  );
+}
+
 try {
   mkdirSync(fakeDir, { recursive: true });
   mkdirSync(emptyDir, { recursive: true });
@@ -855,6 +1214,15 @@ try {
   await verifyArgumentsAndRoot();
   await verifyInsideRootOnly();
   await verifyNoShell();
+
+  // 第 6 节要起真的临时仓库：原始 PATH 上找不到 git 时整节跳过（与 verify-git.mjs 同一道闸）。
+  if (realGit === null) {
+    skip("真实仓库的用例（6.6 / 6.7 / 6.8）：原始 PATH 上没有 git");
+  } else {
+    await verifyRemoteCapability();
+    await verifyRemoteOpen();
+    await verifyReadOnlyActions();
+  }
 
   // 汇总行带上跳过数：跳过不算失败、不改退出码，但必须看得见（否则 CI 上是零覆盖）。
   const verdict = failures === 0 ? "REMOTE VERIFY PASSED" : `${failures} FAILURE(S)`;
