@@ -74,33 +74,33 @@ Feature Name: open-in-editor-and-remote
   - [x] 5.3 性质测试：只产出 `http(s)` 绝对地址（对应 Correctness Property 3）
     - 对随机生成的输入串，断言输出要么被拒绝，要么是可解析的 `http(s)` URL 且 host 非空——不可能出现其它协议。覆盖 Requirement 4.7、5.5、5.6。
 
-- [ ] 6. 主进程：打开仓库、列表判定与通道路由（`main.js`）
-  - [ ] 6.1 实现 `remoteUrlFor(rootPath)`
+- [x] 6. 主进程：打开仓库、列表判定与通道路由（`main.js`）
+  - [x] 6.1 实现 `remoteUrlFor(rootPath)`
     - 用既有的 `runGitCommand`（L834）跑只读的 `git remote get-url origin`（`maxBytes: 4096`），沿用 `GIT_OPTIONAL_LOCKS=0` / `GIT_TERMINAL_PROMPT=0` / `GIT_LITERAL_PATHSPECS=1` 与 5 秒超时。覆盖 Requirement 4.1、5.4。
     - 非仓库抛 `NO_REPO`、无 origin 抛 `NO_REMOTE`、git 缺失抛既有的 `GIT_UNAVAILABLE`、地址不可规范化抛 `REMOTE_NOT_OPENABLE`。覆盖 Requirement 4.8–4.10。
 
-  - [ ] 6.2 实现 `remoteCapabilityFor(rootPath, snapshot)` 与其缓存
+  - [x] 6.2 实现 `remoteCapabilityFor(rootPath, snapshot)` 与其缓存
     - 复用 `handleList` 已经取到的 `snapshot`，不在同一次调用里再跑第二个 git 进程；「取 origin」这一步只在 `snapshot !== null` 时发起。
     - `snapshot === null` 时用 `gitBinary === null` 区分「机器上没有 git」（`noGit`）与「这个文件夹不是仓库」（`noRepo`）——这两种成因对应两句不同的用户提示。覆盖 Requirement 4.11。
     - origin 与规范化结果随 git 快照一起缓存（同一 TTL 2s），并随既有的 `invalidateGitSnapshots()` 一起作废。
 
-  - [ ] 6.3 实现 `handleRemoteOpen()`
+  - [x] 6.3 实现 `handleRemoteOpen()`
     - 无项目时抛 `NO_WORKSPACE`；经 `remoteUrlFor` 得到地址后只调 `pi.shell.openExternal(url)`，成功返回 `{ ok: true, url }`。
     - 宿主拒绝（`DISALLOWED_EXTERNAL_URL`）或任何异常一律由既有的 `toFailure` 折算成 `{ ok: false, code, message }`，绝不返回成功。覆盖 Requirement 3.1–3.3、3.5。
 
-  - [ ] 6.4 `handleList`（L1518）追加 `remote` 字段
+  - [x] 6.4 `handleList`（L1518）追加 `remote` 字段
     - 在返回对象里追加 `remote: await remoteCapabilityFor(rootPath, snapshot)`，与既有的 `git: snapshot ? summarizeGit(snapshot) : { available: false }` 并列。覆盖 Requirement 4.11。
-  - [ ] 6.5 注册通道与导出纯函数
+  - [x] 6.5 注册通道与导出纯函数
     - `CHANNELS`（L2601）增加 `"fm.editor.open": handleEditorOpen` 与 `"fm.remote.open": handleRemoteOpen`。
     - `internals`（L2660）导出 `normalizeRemoteUrl`、`windowsCommandLine`、`isUnsafeForCmd`，供 `verify-remote.mjs` 直接断言；沿用既有「纯解析函数可以被单测」的注释约定。覆盖 Requirement 1、3、5.3。
 
-  - [ ] 6.6 端到端用例：真实仓库的四种判定
+  - [x] 6.6 端到端用例：真实仓库的四种判定
     - 临时仓库加 `origin` → `fm.list` 的 `remote.available === true` 且 url 正确；改 `origin` 为本地路径 → `available: false, reason: "notOpenable"`；删掉 `origin` → `noRemote`；非仓库目录 → `noRepo`。覆盖 Requirement 4.8–4.11。
 
-  - [ ] 6.7 端到端用例：宿主调用与拒绝
+  - [x] 6.7 端到端用例：宿主调用与拒绝
     - 桩宿主记录 `shell.openExternal` 收到的 URL，断言它等于规范化结果、且只被调用一次；桩宿主拒绝时断言 `fm.remote.open` 返回 `{ ok: false }` 而不是 `{ ok: true }`。覆盖 Requirement 3.2、3.3、3.5。
 
-  - [ ] 6.8 性质测试：两个动作全程只读（对应 Correctness Property 4）
+  - [x] 6.8 性质测试：两个动作全程只读（对应 Correctness Property 4）
     - 对随机路径组合反复调用两条通道，断言仓库的 `.git` 内容与工作区文件在调用前后逐字节不变，且调用过的 git 子命令只有 `remote get-url`。覆盖 Requirement 4.1、5.4。
 
 - [ ] 7. 检查点 - 确保所有测试通过,如有疑问请询问用户
