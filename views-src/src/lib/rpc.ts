@@ -143,6 +143,12 @@ export type Limits = {
   maxListEntries: number;
 };
 
+/** fm.hello 带回的 VS Code 命令行探测结果：视图据此决定菜单项是否可用。 */
+export type EditorCapability = {
+  /** 探测到的可执行文件路径；null = PATH 上没有 code 命令。 */
+  binary: string | null;
+};
+
 /**
  * 首次握手：项目组（与 workspace.get 同一个形状——path/name 是组的**主根**）、
  * 当前偏好、上限与忽略规则文件名。「当前在看哪个 folder root」不在这个字段里：
@@ -156,7 +162,31 @@ export type HelloResponse = {
   /** 监听能力：不能监听时视图不给一个永远没反应的开关。 */
   watch: WatchCapability;
   prefs: Prefs;
+  /** VS Code 命令行探测结果（0.9.0）；没找到时降级成 binary: null，不挡住握手。 */
+  editor: EditorCapability;
 };
+
+/** 「在浏览器打开仓库」不可用的原因键；视图据此挑一句提示文案。 */
+export type RemoteReason =
+  | "noRepo" // 这个文件夹不是 git 仓库
+  | "noRemote" // 是仓库，但没有配置 origin
+  | "notOpenable" // 取到 origin 了，但规范不成 http(s) 地址
+  | "noGit"; // 这台机器上没有 git
+
+/** 基点文件夹的仓库首页能力：不可用时给出原因键，可用时给出将打开的地址。 */
+export type RemoteCapability =
+  | {
+      available: false;
+      /** 不可用的成因；四种取值对应四句不同的用户提示。 */
+      reason: RemoteReason;
+    }
+  | {
+      available: true;
+      /** 规范化后的仓库首页地址（http 或 https）。 */
+      url: string;
+      /** 地址里的主机名，菜单提示用它（例如 github.com）。 */
+      host: string;
+    };
 
 export type ListResponse = {
   ok: true;
@@ -167,6 +197,8 @@ export type ListResponse = {
   ignoreActive: boolean;
   /** 整个工作区的改动概览（供头部那一句用）；没有 git 时 available 为 false。 */
   git: GitSummary;
+  /** 这个基点文件夹能不能打开仓库首页（0.9.0）；判定随基点变化，所以挂在 list 上。 */
+  remote: RemoteCapability;
 };
 
 export type TextRead = {
@@ -376,6 +408,29 @@ export function isConflict(response: WriteResponse): response is ConflictFailure
   return !response.ok && response.code === "CONFLICT" && "mtimeMs" in response;
 }
 
+/** 「用 VSCode 打开」请求：path 省略或空串 = 基点文件夹自身（项目根）。 */
+export type EditorOpenRequest = { path?: string };
+
+/** 「用 VSCode 打开」的响应；失败分支复用 Failure。 */
+export type EditorOpenResponse =
+  | {
+      ok: true;
+      /** 实际交给 code 的绝对路径：省略 path 时就是基点文件夹自身的绝对路径。 */
+      path: string;
+      /** 实际启动的命令行路径；Windows 上是解析到的 code.cmd。 */
+      binary: string;
+    }
+  | Failure;
+
+/** 「在浏览器打开仓库」的响应；失败分支复用 Failure。 */
+export type RemoteOpenResponse =
+  | {
+      ok: true;
+      /** 送进宿主 shell.openExternal 的仓库首页地址，协议一定是 http 或 https。 */
+      url: string;
+    }
+  | Failure;
+
 export const channels = {
   hello: "fm.hello",
   prefsGet: "fm.prefs.get",
@@ -393,6 +448,8 @@ export const channels = {
   sqliteQuery: "fm.sqlite.query",
   gitDiff: "fm.git.diff",
   watch: "fm.watch",
+  editorOpen: "fm.editor.open",
+  remoteOpen: "fm.remote.open",
 } as const;
 
 /** 把失败响应统一成人话，供 UI 直接展示。 */
