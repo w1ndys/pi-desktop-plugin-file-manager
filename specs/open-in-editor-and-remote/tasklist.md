@@ -15,15 +15,15 @@ Feature Name: open-in-editor-and-remote
   - `version`（L5）由 `0.8.2` 改为 `0.9.0`（新增用户可见能力，走 minor）。
   - `i18n` 的 `en`/`zh-CN` 两份 `description` 与 `safetyNotes` 各补一段：VSCode 由插件进程自己启动、只传经根内包含校验与凭据黑名单的绝对路径（POSIX 上参数数组直传 + `shell: false`；Windows 上 `code.cmd` 必须经 `cmd.exe`，改用显式构造的双引号命令串、`/d` 关 AutoRun、不传 `/v`，并拒绝含 `%` 的路径）；浏览器打开走宿主 `shell.openExternal` 并为此新增该权限、宿主另有 http/https/mailto 白名单作为第二道闸、只送规范化后的 `http(s)` 地址；两项都不写文件、不写仓库、插件自己不发起网络请求。覆盖 Requirement 5.1–5.6。
 
-- [ ] 3. 主进程：VS Code 命令行的探测与启动（`main.js`）
-  - [ ] 3.1 实现 `resolveEditorBinary()`：只在 `PATH` 上查找
+- [x] 3. 主进程：VS Code 命令行的探测与启动（`main.js`）
+  - [x] 3.1 实现 `resolveEditorBinary()`：只在 `PATH` 上查找
     - 取 `process.env.PATH`，按平台分隔符（POSIX `:`、Windows `;`）切分，逐个目录查找可执行文件。
     - **不做任何兜底**：不写死 `/Applications/Visual Studio Code.app/…`、`/opt/homebrew/bin/code`、`/snap/bin/code` 这类安装路径，不读注册表或应用清单。找不到就是找不到。覆盖 Requirement 2.1、2.5。
     - 命中判定：POSIX 用 `fs.access(binary, X_OK)`；Windows 上 `code.cmd` 没有执行位，`fs.stat` 判存在且是文件即可。**不真正启动进程**去问 `--version`。
     - Windows 上找的是 **`code.cmd`**（大小写不敏感）；仅存在 `Code.exe` 而 `PATH` 上没有 `code.cmd` 时判为未找到。覆盖 Requirement 2.7。
     - 探测结果（命中路径或 `null`）按插件进程缓存一次：进程的 `PATH` 生命周期内不变，改 `PATH` 需重新加载插件。覆盖 Requirement 2.2。
 
-  - [ ] 3.2 新增 `spawnDetached(binary, target)` 与两个可单测的纯函数
+  - [x] 3.2 新增 `spawnDetached(binary, target)` 与两个可单测的纯函数
     - POSIX：`spawn(binary, [target], { detached: true, stdio: "ignore", windowsHide: true, shell: false })` 后 `child.unref()`；参数是数组、不经 shell，路径里的空格、`$(…)`、反引号、换行都只是普通字符。覆盖 Requirement 1.3、5.3。
     - Windows：`code.cmd` 是批处理文件，`CreateProcess` 不能直接执行它（`shell: false` 直接 spawn 会以 `EINVAL` 失败），必须 `spawn(comSpecPath(), ["/d", "/s", "/c", windowsCommandLine(binary, target)], …)`；`ComSpec` 优先、回退 `<SystemRoot>\System32\cmd.exe`，两者都拿不到时按 `EDITOR_UNAVAILABLE` 失败，不猜别的解释器。覆盖 Requirement 1.3、2.7。
     - 两个纯函数：`windowsCommandLine(codeCmd, target)` 拼命令串（两个路径各自双引号包裹），`isUnsafeForCmd(target)` 判 `%`。它们导出到 `internals`，好在任何平台上单测。覆盖 Requirement 5.3。
@@ -31,13 +31,13 @@ Feature Name: open-in-editor-and-remote
     - 5 秒超时兜底：超时判失败但**不 kill**（进程已交给系统）。覆盖 Requirement 1.4。
     - spawn 用惰性 require 拿（照 `gitSpawnFn` L745 的降级写法），拿不到时返回可识别的失败而不是抛出未捕获异常。
 
-  - [ ] 3.3 新增 `handleEditorOpen(payload)`
+  - [x] 3.3 新增 `handleEditorOpen(payload)`
     - `payload.path` 省略或为空串时按基点文件夹自身处理（`path: ""`）；路径一律经 `resolveInsideRoot`（L261）并传 `allowRoot: true`，复用它的根内包含、凭据黑名单与 realpath 逃逸校验。覆盖 Requirement 1.1、1.2、1.5、1.6。
     - `PATH` 上没有可执行文件时抛 `EDITOR_UNAVAILABLE`，message 要点名 `PATH` 与 `code`（如 `the code command is not on PATH`），不要只说「找不到 VS Code」；启动失败（ENOENT / EACCES）折算成同一 code；两者都不允许静默成功。覆盖 Requirement 1.7、2.4、2.6。
     - Windows 分支：目标路径含 `%` 时抛 `EDITOR_UNSUPPORTED_PATH` 且不 spawn（`%VAR%` 会被 `cmd.exe` 展开，双引号屏蔽不掉）。覆盖 Requirement 5.3。
     - 成功返回 `{ ok: true, path: abs, binary }`。
 
-  - [ ] 3.4 在 `views-src/verify-remote.mjs` 中建立脚本骨架与门禁接线，并补上探测相关的判定用例
+  - [x] 3.4 在 `views-src/verify-remote.mjs` 中建立脚本骨架与门禁接线，并补上探测相关的判定用例
     - 新建 `views-src/verify-remote.mjs`，沿用 `verify-git.mjs` 的 `check(label, condition, detail)` 与退出码约定；在 `views-src/package.json` 的 `scripts` 里增加 `"verify:remote"` 并把 `node verify-remote.mjs` 挂进既有的 `verify` 串联命令末尾。
     - 端到端需要换探测结果时，先 `delete require.cache[require.resolve(pluginMain)]` 再重新 `require`：`editorBinary` 是进程级缓存，同一次加载里改不了。
     - 观测 spawn 的做法：在临时目录写一个可执行的假 `code` 脚本（把 `process.argv.slice(2)` 逐行追加到日志文件），把该目录放在 `PATH` 最前之后 `onLoad`；断言改为读日志文件。**不需要**为测试在 `main.js` 里加专用钩子。Windows 上假脚本要命名为 `code.cmd`（批处理文件），断言的是 `cmd.exe` 收到的 `argv[3]` 恰为 `windowsCommandLine` 的输出；这条只在 Windows 上跑。
@@ -45,16 +45,17 @@ Feature Name: open-in-editor-and-remote
     - 用例（二）未命中：把 `PATH` 指向一个不含 `code` 的空目录时 `editor.binary === null`、`fm.hello` 照旧成功返回，且 `fm.editor.open` 返回 `EDITOR_UNAVAILABLE`，其 message 里出现 `PATH`。覆盖 Requirement 2.1、2.3、2.4、2.6。
     - 用例（三）不做兜底：在机器确实装了 VS Code 的前提下清空 `PATH`，断言仍判为未找到——证明插件没有绕过 `PATH` 去猜安装位置。覆盖 Requirement 2.5。
 
-  - [ ] 3.5 端到端用例：参数安全与项目根
+  - [x] 3.5 端到端用例：参数安全与项目根
     - 建一个名字含空格、`;`、`$()`、反引号的目录，请求打开它，断言假 `code` 收到的参数与该名字**逐字节相等**。覆盖 Requirement 1.3、5.3。
     - 断言 `fm.editor.open` 不传 `path` 时，目标是基点文件夹的本地绝对路径。覆盖 Requirement 1.2。
     - 断言传 `../outside.txt`、`.env`、`.ssh/id_rsa` 与指向根外的符号链接时全部被拒，且日志文件**没有新增行**（证明未发生 spawn）。覆盖 Requirement 1.6。
     - 含 `%` 的路径：POSIX 上照常打开（`%` 只是普通字符），Windows 上由 3.3 拒绝——后者用 `isUnsafeForCmd` 的纯函数断言覆盖。覆盖 Requirement 5.3。
 
-  - [ ] 3.6 性质测试：通道只接受基点内的路径（对应 Correctness Property 1）
+  - [x] 3.6 性质测试：通道只接受基点内的路径（对应 Correctness Property 1）
     - 对随机生成的越界路径 / 凭据名字 / 逃逸链接，断言 `handleEditorOpen` 一律拒绝且不产生 spawn 记录。覆盖 Requirement 1.6。
+    - 顺带钉住输入面：**绝对路径一律被 `ABSOLUTE_PATH` 拒掉**（含「绝对路径形式的基点自身」）。这条通道只接受基点相对路径，是有意的窄契约，不是遗漏——理由是 Requirement 1.5，且它会启动外部程序，输入面越窄越好。**不要**为了让绝对路径能通过而去改 `main.js`。
 
-  - [ ] 3.7 性质测试：参数不经 shell（对应 Correctness Property 2）
+  - [x] 3.7 性质测试：参数不经 shell（对应 Correctness Property 2）
     - 对随机生成的合法条目名（含各种 shell 元字符与不可打印字符），断言假 `code` 收到的参数与原名逐字节相等，即元字符从未被解释。覆盖 Requirement 1.3、5.3。
     - Windows 侧改成断言纯函数 `windowsCommandLine` 的输出：两个路径各自被一对双引号包裹、输出里除这两对引号外不再出现别的引号（引号跳不出去）；并断言含 `%` 的路径被 `isUnsafeForCmd` 拦下。覆盖 Requirement 5.3。
 
@@ -123,7 +124,7 @@ Feature Name: open-in-editor-and-remote
     - 两者都不得触碰当前打开的文件与未保存状态，也不得弹未保存确认框。覆盖 Requirement 6.6。
   - [ ] 9.3 `menuEntries`（L1016）追加一组分隔线与两个菜单项
     - 标签随目标切换（文件/目录为成员动作，空白处为项目动作）；`disabled` 分别跟 `editorAvailable` 与 `remote.available` 走，`hint` 在不可用时给出对应原因、可用时给出将打开的 host。覆盖 Requirement 6.1–6.4。
-    - 文件 / 目录的路径用 `hostActionPath(target.path, activeRootRef.current)`（`lib/roots.ts` L219）——它已经解决了「基点不是主文件夹时要送绝对路径」；空白处右键时不传 `path`，交由主进程的 `currentRoot()` 解析。覆盖 Requirement 1.2、1.5。
+    - 文件 / 目录送**基点相对路径**，也就是树里那个 `target.path` 原样送出去（与 `fm.read` / `fm.delete` 送 `entry.path` 完全一致）；空白处右键时不传 `path`，交由主进程的 `currentRoot()` 解析成基点文件夹自身。**不要**用 `lib/roots.ts` 的 `hostActionPath`：那是给宿主代为执行的 `fs.openDefault` / `fs.reveal` 用的（宿主只收工作区相对路径、按主文件夹解析，所以基点不是主文件夹时必须送绝对路径）；本通道由插件自己解析路径，`resolveInsideRoot` 会以 `ABSOLUTE_PATH` 拒掉绝对路径（已实测）。覆盖 Requirement 1.2、1.5。
     - 两项都沿用既有菜单的键盘规则（`↑↓` / `Home` / `End` / `Enter` / `Escape`、禁用项跳过焦点），不需要改 `ContextMenu.tsx`。覆盖 Requirement 6.8。
   - [ ] 9.4 视图判定用例
     - 断言 `editor.binary === null` 与 `remote.reason` 的四种取值下，两个菜单项的 `disabled` 与 `hint` 文案正确；可用时不再禁用且给出 host。覆盖 Requirement 6.3、6.4。

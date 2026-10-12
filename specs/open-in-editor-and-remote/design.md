@@ -319,7 +319,7 @@ export function openRepoInBrowser(): Promise<{ url: string }>;
   // 探测不到命令行时禁用，hint 说明原因（Requirement 6.3）。
   disabled: !editorAvailable,
   hint: editorAvailable ? undefined : t("editorUnavailable"),
-  onPick: () => runEditorOpen(target ? hostActionPath(target.path, activeRootRef.current) : undefined),
+  onPick: () => runEditorOpen(target ? target.path : undefined),
 },
 {
   kind: "item",
@@ -330,7 +330,7 @@ export function openRepoInBrowser(): Promise<{ url: string }>;
 },
 ```
 
-- **路径语义**：文件 / 目录用 `hostActionPath(...)`（`lib/roots.ts` L219）——它已经解决「基点不是主文件夹时要送绝对路径」这个问题（0.5.1 修的那个缺陷），VSCode 这条通道同样需要绝对路径，同一个函数复用。
+- **路径语义**：文件 / 目录送**基点相对路径**，也就是树里那个 `target.path` 原样送出去（与 `fm.read` / `fm.delete` 送 `entry.path` 完全一致）；主进程用唯一入口守卫 `resolveInsideRoot` 把它解析成绝对路径。**不要**用 `lib/roots.ts` 的 `hostActionPath`：那个函数是给**宿主代为执行**的 `fs.openDefault` / `fs.reveal` 用的（宿主的这两条通道只接受工作区相对路径、按主文件夹解析，所以基点不是主文件夹时必须送绝对路径），而本通道的路径由插件自己解析，送绝对路径会被 `resolveInsideRoot` 的 `normalizeRelative` 以 `ABSOLUTE_PATH` 拒掉（已实测）。Requirement 1.5 定的就是「视图送基点相对路径、主进程解析成绝对路径」这条约定。
 - **项目根**：空白处右键时 `target` 为 `null`，此时**不传 `path`**，由主进程按基点文件夹解析。刻意不在视图侧拼基点路径：主进程那边的 `currentRoot()` 是唯一真相来源。
 - `remote` 从 `loadDirectory` 的响应里取（`setRemote(response.remote)`），与既有的 `setGitSummary(response.git)` 完全同构，放在同一个 `useCallback` 里。
 
@@ -421,7 +421,7 @@ let editorSpawn  = null;       // 懒拿的 child_process.spawn，同 gitSpawnFn
 
 - `t()` 文案键 en / zh 一一对齐（复用 `verify-git.mjs` 第 6 节既有断言的做法，直接把新键纳入检查）。
 - 菜单可用性：给定 `{ editor: { binary: null } }` 与 `remote: { available: false, reason }` 的四种 reason，断言菜单项 `disabled` 与 `hint` 文案正确；给定可用值断言不再禁用。
-- 「空白处右键 → 不带 path」与「文件右键 → 送 `hostActionPath` 的绝对路径」两条分支的路径参数断言。
+- 「空白处右键 → 不带 path」与「文件右键 → 送基点相对路径 `target.path`」两条分支的路径参数断言；再补一条「送绝对路径必须被 `ABSOLUTE_PATH` 拒掉」（证明这条通道不接受绝对路径，输入面窄到只剩基点相对路径）。
 
 ### 层 3：端到端（桩宿主 + 真实 main.js）
 
