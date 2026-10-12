@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "./lib/bridge";
 import { watchAppearance, type Base, type Locale as HostLocale } from "./lib/appearance";
 import { watchWorkspace, workspaceKey, type Workspace } from "./lib/workspace";
-import { channels, failureMessage, isConflict, type DeleteResponse, type Failure, type FileEntry, type GitDiffResponse, type GitSummary, type HelloResponse, type ListResponse, type Prefs, type PrefsResponse, type ReadRequest, type ReadResponse, type SearchHit, type SearchResponse, type WatchResponse, type WriteRequest, type WriteResponse } from "./lib/rpc";
+import { channels, failureMessage, isConflict, type DeleteResponse, type Failure, type FileEntry, type GitDiffResponse, type GitSummary, type HelloResponse, type ListResponse, type Prefs, type PrefsResponse, type ReadRequest, type ReadResponse, type RemoteCapability, type SearchHit, type SearchResponse, type WatchResponse, type WriteRequest, type WriteResponse } from "./lib/rpc";
 import { gitSummaryText, lookupGit } from "./lib/git";
 import { decideWatchAction } from "./lib/watch";
 import { baseNameOf, parentOf } from "./lib/format";
@@ -11,7 +11,8 @@ import { findRootForPath, hostActionPath, normalizeRoots, primaryRootOf, project
 import { makeT, type T } from "./i18n";
 import { resolveViewer, type ViewerMode } from "./lib/viewers";
 import { toOpenFile, withSavedContent, type OpenFile } from "./lib/openFile";
-import { openWithDefaultApp, revealInFileManager } from "./lib/hostActions";
+import { openInEditor, openWithDefaultApp, revealInFileManager } from "./lib/hostActions";
+import { editorMenuState, openRepoInBrowser, remoteMenuState } from "./lib/remoteOpen";
 import { isExternalPath, watchHostOpenRequests, type HostOpenRequest } from "./lib/hostOpen";
 import type { DiffViewState } from "./components/GitDiffView";
 import { Tree, type DirState } from "./components/Tree";
@@ -85,6 +86,16 @@ export default function App() {
   const [diff, setDiff] = useState<(DiffViewState & { path: string }) | null>(null);
   /** 这个运行时能不能监听（0.8.0）；不能就把「自动刷新」开关显示成不可用。 */
   const [watchAvailable, setWatchAvailable] = useState(true);
+  /**
+   * fm.hello 探测到的 VS Code 命令行（0.9.0）。false 时「用 VSCode 打开」这一项禁用，
+   * 并在悬停提示里说明要去补 PATH。
+   */
+  const [editorAvailable, setEditorAvailable] = useState(false);
+  /**
+   * 基点文件夹的仓库首页能力（0.9.0），跟着最近一次列表刷新走。null = 判定还没到手
+   * （首次列表返回之前），此时「在浏览器打开仓库」按不可用处理。
+   */
+  const [remote, setRemote] = useState<RemoteCapability | null>(null);
   /**
    * 打开的文件在外部被改了、而缓冲里还有未保存的改动。
    * 这时**不自动装载**——静默丢掉用户刚敲的字是最糟的一种「自动」；只提示一句，
@@ -309,6 +320,9 @@ export default function App() {
           // 监听不可用（老平台 / 运行时不给 fs.watch）时，开关显示成不可用，
           // 而不是让用户开了却永远没反应。
           if (hello.watch) setWatchAvailable(hello.watch.available);
+          // PATH 上没有 code 命令时「用 VSCode 打开」那一项是禁用的；探测本身也
+          // 「尽力而为」：拿不到就按不可用处理，不让视图卡在加载态。
+          if (hello.editor) setEditorAvailable(hello.editor.binary !== null);
           workspace = hello.root;
         }
       } catch {
@@ -366,6 +380,9 @@ export default function App() {
         // 概览是整个工作区的（与列的是哪个目录无关），所以任何一次列表刷新都拿
         // 最新的一份回来；徽标已经随每条 entry 一起进来了。
         setGitSummary(response.git ?? null);
+        // 「这个基点能不能打开仓库首页」同样跟基点走：与 git 概览并列，在同一次列表
+        // 刷新里一起回来，省掉为渲染菜单再跑一趟。
+        setRemote(response.remote ?? null);
       } catch (cause) {
         if (revision !== revisionRef.current) return;
         setDir({ error: String((cause as Error).message) });
@@ -973,8 +990,8 @@ export default function App() {
     setMenu({ x: event.clientX, y: event.clientY, entry });
   };
 
-  /** 链接不导航：视图一旦离开插件页面就回不来了，而本插件也没申报
-   *  shell.openExternal。所以点击的语义是把地址告诉用户。 */
+  /** 链接不导航：视图一旦离开插件页面就回不来。所以点击的语义是把地址告诉用户
+   *  （而不是替用户打开它——那是右键菜单里「在浏览器打开仓库」那条显式入口的事）。 */
   const onLink = useCallback(
     (url: string) => {
       void invoke("ui.showToast", { message: tRef.current("linkHint", { url }) }).catch(() => {});
@@ -993,6 +1010,34 @@ export default function App() {
       void invoke("ui.showToast", {
         message: tRef.current(action === "open" ? "openError" : "revealError"),
       }).catch(() => {});
+    });
+  }, []);
+
+  /**
+   * 「用 VSCode 打开」（0.9.0）：由插件主进程自己启动 code 命令行，不走宿主网关，
+   * 所以目标可以是文件、目录，也可以是基点文件夹自身。
+   *
+   * 失败走 toast——它只影响这一次点击，与当前打开的文件无关，不该占用插件的错误横幅。
+   * 这个动作也**不碰**当前打开的文件与未保存状态：用户只是想拿别处的编辑器看一眼，
+   * 不该被未保存确认框拦下来（Requirement 6.6）。
+   */
+  const runEditorOpen = useCallback((path?: string) => {
+    void openInEditor(path).catch((cause: unknown) => {
+      // 「这条路径在 Windows 上不能安全交给 cmd.exe」是用户自己能处理的一种失败
+      // （换个路径就可以），与「命令行不在 PATH 上」该说的话不一样，按原因码挑文案。
+      const code = (cause as { code?: string } | null)?.code;
+      const message = code === "EDITOR_UNSUPPORTED_PATH" ? "editorUnsupportedPath" : "editorOpenError";
+      void invoke("ui.showToast", { message: tRef.current(message) }).catch(() => {});
+    });
+  }, []);
+
+  /**
+   * 「在浏览器打开仓库」（0.9.0）：地址由主进程取 origin 并规范化，再交给宿主的
+   * shell.openExternal，视图这边只负责发起与报错。同样不碰打开的文件与未保存状态。
+   */
+  const runRemoteOpen = useCallback(() => {
+    void openRepoInBrowser().catch(() => {
+      void invoke("ui.showToast", { message: tRef.current("remoteOpenError") }).catch(() => {});
     });
   }, []);
 
@@ -1083,6 +1128,32 @@ export default function App() {
         onPick: () => runHostAction("reveal", hostActionPath(target.path, activeRootRef.current)),
       });
     }
+    // 下面是把目标交给外部程序的一组动作（0.9.0），与上面那组文件操作之间隔一条分隔线。
+    const editorState = editorMenuState(editorAvailable, t);
+    const remoteState = remoteMenuState(remote, t);
+    entries.push(
+      { kind: "separator" },
+      {
+        kind: "item",
+        // 文件 / 目录上是成员动作，空白处是项目动作（Requirement 6.1 / 6.2）。
+        label: target ? t("openInVSCode") : t("openProjectInVSCode"),
+        disabled: editorState.disabled,
+        hint: editorState.hint,
+        // 送基点相对路径，也就是树里那个 target.path 原样送出去（与 fm.read / fm.delete
+        // 送 entry.path 一致）；空白处**不传** path，由主进程按基点文件夹自身解析。
+        // 不要用 hostActionPath：那是给宿主执行的 fs.openDefault / fs.reveal 用的，
+        // 本通道送绝对路径会被主进程按 ABSOLUTE_PATH 拒掉。
+        onPick: () => runEditorOpen(target ? target.path : undefined),
+      },
+      {
+        kind: "item",
+        label: t("openRemote"),
+        // 判定来自 fm.list 的 remote 字段，跟着基点走（Requirement 6.4）。
+        disabled: remoteState.disabled,
+        hint: remoteState.hint,
+        onPick: () => runRemoteOpen(),
+      },
+    );
     return entries;
   };
 
