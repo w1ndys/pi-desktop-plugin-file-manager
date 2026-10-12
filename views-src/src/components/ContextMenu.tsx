@@ -140,8 +140,12 @@ export function ContextMenu({ x, y, entries, onClose }: Props) {
               {entry.icon}
             </span>
             <span className="min-w-0 flex-1 truncate">{entry.label}</span>
+            {/* 提示是整句中文（如 PATH 里没有 code 命令那句）时，不加约束会把这个
+                178px 宽的菜单一路撑开：菜单比面板还宽时视口夹取会退化成靠左 8px、右侧
+                被切掉。所以给一个上限并省略号收尾；完整文案仍在这个按钮的 title 上，
+                悬停就能看全，信息不丢。 */}
             {entry.hint ? (
-              <span className="flex-none text-[10.5px]" style={{ color: "var(--faint)" }}>
+              <span className="max-w-[200px] flex-none truncate text-[10.5px]" style={{ color: "var(--faint)" }}>
                 {entry.hint}
               </span>
             ) : null}

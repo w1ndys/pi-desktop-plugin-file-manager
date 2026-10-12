@@ -2,7 +2,7 @@
  * 用 VS Code 打开 / 在浏览器打开仓库（0.9.0）：`code` 探测、启动参数与路径守卫、
  * origin 地址规范化的离线校验。
  *
- * 六组，对应 tasklist 的 3.4 / 3.5 / 3.6 / 3.7 / 5.2 / 5.3 / 6.6 / 6.7 / 6.8：
+ * 八组，对应 tasklist 的 3.4 / 3.5 / 3.6 / 3.7 / 5.2 / 5.3 / 6.6 / 6.7 / 6.8 / 9.4 / 10.2 / 12.2：
  *   ① 探测：只认 PATH——命中（PATH 最前放一个假的 code 命令行）、未命中（PATH 指向一个
  *      不含 code 的空目录）、不做安装位置兜底（本机装了 VS Code 也照样判未找到）。
  *   ② 参数安全与项目根：根内路径逐字节送达假脚本；省略 path 落到基点文件夹；
@@ -18,7 +18,16 @@
  *      各一次）、宿主 `shell.openExternal` 收到的地址与拒绝时的失败响应，以及性质
  *      「两个动作全程只读」（design.md Correctness Property 4）。本机没有 git 时整节跳过；
  *      Windows 上只跳过「git 子命令记录」那一条（假 git 包装器在那边造不出来）。
- *
+ *   ⑦ 视图调用层与菜单判定（9.4 / 10.2）：把 lib/hostActions.ts、lib/remoteOpen.ts 与
+ *      i18n.ts 打成一份 ESM 直接 import 进来（用桩 bridge 观察视图往哪条通道送了什么样的
+ *      payload），断言两个菜单项的 disabled 与 hint、「这一项送什么路径」的纯函数
+ *      editorTargetPath、路径参数与中英键位对齐。它**不依赖**
+ *      假脚本与 git，所以排得很靠后且必定执行。
+  *
+ *   ⑧ 降级不牵连的回归（12.2）：`editor.binary === null`、机器上没有 git、不是仓库、仓库没有
+ *      origin 这四档降级各发生时，列目录 / 读 / 写 / 保存 / 删除 / 搜索与 `fm.watch` 都与
+ *      全环境基线逐项一致（design.md Correctness Property 7）。
+  *
  * 观测手法：临时目录里写一个假的可执行脚本，它把自己收到的每个参数逐行追加到日志
  * 文件；把该目录放在 PATH 最前再加载 main.js，`resolveEditorBinary` 命中的就是它，
  * 绝不会真的启动 VS Code。日志是**异步**写的（spawnDetached 在子进程的 'spawn'
@@ -38,13 +47,14 @@
  * 用法：pnpm verify:remote
  */
 
+import { build } from "esbuild";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { accessSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import Module, { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pluginMain = join(here, "..", "main.js");
@@ -1201,6 +1211,448 @@ async function verifyReadOnlyActions() {
   );
 }
 
+/**
+ * 7. 视图调用层与菜单判定（9.4 / 10.2）。
+ *
+ * 这一节测的是 lib/ 里的纯函数与调用层，不碰主进程、不碰 PATH，所以必定执行（不受
+ * 假脚本硬闸与「本机有没有 git」影响）。两个菜单项的判定纯函数被搬出 App.tsx 就是为了
+ * 能在这里离线断言：App.tsx 是渲染组件，判定留在里面就只能靠人手点着看。
+ *
+ * 桩 bridge：视图模块读 window.pluginBridge，给 globalThis 挂一个假的就能看到「点了
+ * 某一项之后，视图到底往哪条通道、送了什么样的 payload」。这一段钉住的是**调用层**：
+ * lib/hostActions.ts 的 openInEditor、lib/remoteOpen.ts 的 openRepoInBrowser，以及
+ * 「这一项要送什么路径」那个纯函数 editorTargetPath——**不是 App.tsx 的渲染**，
+ * App.tsx 在本脚本里从未被加载。App.tsx 那两处 onPick 只是
+ * `runEditorOpen(editorTargetPath(target ? target.path : null))` 与 `runRemoteOpen()`，
+ * 所以下面分两段把同一件事钉住：先单独断言 editorTargetPath（相对路径原样返回、
+ * null / 空串给 undefined），再把它的返回值喂进 openInEditor 查 payload。少了前一段，
+ * 只调 openInEditor("src/a.ts") 什么也证明不了——把 App.tsx 那行换成 hostActionPath(...)
+ * 这一节照样全绿。
+ */
+async function verifyViewLayer() {
+  console.log("\n7. 视图调用层与菜单判定（9.4 / 10.2）");
+
+  const view = await loadViewModules();
+  const { openInEditor } = view.hostActions;
+  const { editorMenuState, editorTargetPath, openRepoInBrowser, remoteMenuState } = view.remoteOpen;
+  const { COPY_TABLES } = view;
+
+  /** 照 i18n.ts 里 makeT 的规则做一份精简版：只做 {占位符} 替换。 */
+  const makeT = (table) => (key, values = {}) =>
+    String(table[key] ?? "").replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? ""));
+  const tZh = makeT(COPY_TABLES.zh);
+  const tEn = makeT(COPY_TABLES.en);
+
+  // ── 10.2 键位对齐 ─────────────────────────────────────────────────────────
+  const enKeys = Object.keys(COPY_TABLES.en);
+  const zhKeys = Object.keys(COPY_TABLES.zh);
+  const missingZh = enKeys.filter((key) => !zhKeys.includes(key));
+  const missingEn = zhKeys.filter((key) => !enKeys.includes(key));
+  check(
+    "中英文案键完全对齐（少一个中文键，界面上就会突然冒一句英文，而 tsc 抓不到）",
+    missingZh.length === 0 && missingEn.length === 0,
+    `zh 缺 ${missingZh.join(",")}；en 缺 ${missingEn.join(",")}`,
+  );
+  const newKeys = [
+    "openInVSCode",
+    "openProjectInVSCode",
+    "editorUnavailable",
+    "editorOpenError",
+    "editorUnsupportedPath",
+    "openRemote",
+    "openRemoteHint",
+    "remoteNoRepo",
+    "remoteNoRemote",
+    "remoteNotOpenable",
+    "remoteNoGit",
+    "remoteOpenError",
+  ];
+  const absent = newKeys.filter((key) => !enKeys.includes(key) || !zhKeys.includes(key));
+  check(`本版新增的 ${newKeys.length} 个键两种语言都有`, absent.length === 0, absent.join(","));
+
+  // ── 9.4「用 VSCode 打开」的可用状态 ───────────────────────────────────────
+  const editorOff = editorMenuState(false, tZh);
+  check("探测不到 code 命令 → 这一项禁用", editorOff.disabled === true, JSON.stringify(editorOff));
+  check(
+    "禁用时的提示就是那条点名 PATH 的文案（Requirement 2.6）",
+    editorOff.hint === COPY_TABLES.zh.editorUnavailable,
+    editorOff.hint,
+  );
+  check(
+    "同一句话英文表里也有（不是回落到中文）",
+    editorMenuState(false, tEn).hint === COPY_TABLES.en.editorUnavailable,
+    editorMenuState(false, tEn).hint,
+  );
+  const editorOn = editorMenuState(true, tZh);
+  check("探测到命令行 → 不再禁用", editorOn.disabled === false, JSON.stringify(editorOn));
+  check("可用时不给悬停提示（标签已经说明白了，空串等于没有提示）", editorOn.hint === "", editorOn.hint);
+
+  // ── 9.4「在浏览器打开仓库」的可用状态 ─────────────────────────────────────
+  const reasonKeys = {
+    noRepo: "remoteNoRepo",
+    noRemote: "remoteNoRemote",
+    notOpenable: "remoteNotOpenable",
+    noGit: "remoteNoGit",
+  };
+  const reasonHints = [];
+  for (const [reason, key] of Object.entries(reasonKeys)) {
+    const state = remoteMenuState({ available: false, reason }, tZh);
+    // 文案从表里取、不写死中文：写死的话改文案时这里会假绿。
+    check(
+      `${reason} → 禁用，提示是 ${key}`,
+      state.disabled === true && state.hint === COPY_TABLES.zh[key],
+      JSON.stringify(state),
+    );
+    reasonHints.push(state.hint);
+  }
+  check("四种不可用原因各给一句不同的话（不是笼统一句）", new Set(reasonHints).size === 4, reasonHints.join(" / "));
+  check(
+    "判定还没到手（remote 为 null）时也禁用，并给一句解释",
+    remoteMenuState(null, tZh).disabled === true && remoteMenuState(null, tZh).hint === COPY_TABLES.zh.remoteNoRepo,
+    JSON.stringify(remoteMenuState(null, tZh)),
+  );
+  const host = "github.com";
+  const remoteOn = remoteMenuState({ available: true, url: `https://${host}/owner/repo`, host }, tZh);
+  check("可用 → 不禁用", remoteOn.disabled === false, JSON.stringify(remoteOn));
+  check(
+    "可用时提示里给出将要打开的 host",
+    remoteOn.hint.includes(host) && remoteOn.hint === COPY_TABLES.zh.openRemoteHint.replace("{host}", host),
+    remoteOn.hint,
+  );
+  // ── editorTargetPath：那一项到底送什么路径（9.4 / 8.1）─────────────────────
+  // 纯函数断言：App.tsx 里那一项传的就是它的返回值，所以调用层的路径口径由它负责。
+  const relative = "src/deep/a.ts";
+  check(
+    "有目标时原样返回基点相对路径（逐字节，不绝对化、不拼基点）",
+    editorTargetPath(relative) === relative && !relative.startsWith("/"),
+    String(editorTargetPath(relative)),
+  );
+  check(
+    "纯透传：喂进去什么就吐什么，函数自己不会把相对路径拼成绝对路径（拒绝绝对路径是主进程 ABSOLUTE_PATH 的责任）",
+    editorTargetPath("../outside.txt") === "../outside.txt" && editorTargetPath("a%b.txt") === "a%b.txt",
+    String(editorTargetPath("../outside.txt")),
+  );
+  check(
+    "空白处（null）返回 undefined：通道里连 path 这个字段都不带，由主进程按基点文件夹自身解析",
+    editorTargetPath(null) === undefined,
+    String(editorTargetPath(null)),
+  );
+  check(
+    "空串与 null 同档（主进程把空串也当基点文件夹自身），不会把空串当成路径送出去",
+    editorTargetPath("") === undefined,
+    String(editorTargetPath("")),
+  );
+
+  // ── 8.1 / 8.2 调用层送出的通道与 payload ─────────────────────────────────
+  /** 桩 bridge 记下的每一次调用；每段断言前清空，免得上一段混进来。 */
+  const calls = [];
+  /** 下一次通道调用要回的响应；成功与失败两种形状各来一遍。 */
+  let reply = { ok: true, path: "/abs/repo/src/a.ts", binary: "/usr/local/bin/code" };
+  globalThis.window = {
+    pluginBridge: {
+      invoke: async (channel, payload) => {
+        calls.push({ channel, payload });
+        return reply;
+      },
+      on: () => () => {},
+    },
+  };
+
+  // 文件右键：App.tsx 那一项的 onPick 送的就是 editorTargetPath(树里的 target.path)。
+  calls.length = 0;
+  const opened = await openInEditor(editorTargetPath("src/a.ts"));
+  check(
+    "「用 VSCode 打开」走 fm.editor.open 通道，且只调一次",
+    calls.length === 1 && calls[0].channel === "fm.editor.open",
+    JSON.stringify(calls),
+  );
+  check(
+    "payload 里的 path 就是 target.path 原样（基点相对：不绝对化、不拼基点）",
+    JSON.stringify(calls[0].payload) === JSON.stringify({ path: "src/a.ts" }),
+    JSON.stringify(calls[0].payload),
+  );
+  check(
+    "成功时把主进程给的绝对路径与命令行路径回传出来",
+    opened.path === reply.path && opened.binary === reply.binary,
+    JSON.stringify(opened),
+  );
+
+  // 空白处右键：App.tsx 传 editorTargetPath(null)，也就是 undefined，payload 里连 path 都没有。
+  calls.length = 0;
+  await openInEditor(editorTargetPath(null));
+  check(
+    "空白处右键的 payload 不带 path 字段（主进程按基点文件夹自身解析）",
+    calls.length === 1 && !("path" in calls[0].payload),
+    JSON.stringify(calls[0].payload),
+  );
+
+  // 失败折算：通道回 { ok: false } 必须抛错，并把原因码带出来（调用方据此挑文案）。
+  reply = { ok: false, code: "EDITOR_UNSUPPORTED_PATH", message: "this path cannot be opened on Windows" };
+  const thrown = await openInEditor("a%b.txt").then(
+    () => null,
+    (cause) => cause,
+  );
+  check("失败响应抛错（调用方只写一个 catch）", thrown !== null, "居然 resolve 了");
+  check(
+    "原因码被带出来，供调用方挑「这条路径不能交给 cmd.exe」那句文案",
+    thrown?.code === "EDITOR_UNSUPPORTED_PATH",
+    String(thrown?.code),
+  );
+
+  // 「在浏览器打开仓库」：不带 payload 调到 fm.remote.open，成功回传地址。
+  reply = { ok: true, url: "https://github.com/owner/repo" };
+  calls.length = 0;
+  const remoteOpened = await openRepoInBrowser();
+  check(
+    "「在浏览器打开仓库」走 fm.remote.open 通道，且不带任何 payload 字段",
+    calls.length === 1 && calls[0].channel === "fm.remote.open" && Object.keys(calls[0].payload ?? {}).length === 0,
+    JSON.stringify(calls),
+  );
+  check("成功时回传实际打开的地址", remoteOpened.url === "https://github.com/owner/repo", JSON.stringify(remoteOpened));
+
+  reply = { ok: false, code: "REMOTE_NOT_OPENABLE", message: "the origin remote is not a web address" };
+  const remoteThrown = await openRepoInBrowser().then(
+    () => null,
+    (cause) => cause,
+  );
+  check("通道失败时抛错，绝不谎称成功", remoteThrown !== null, "居然 resolve 了");
+
+  // 桩 bridge 用完就撤：后面再没有视图模块的调用，别把 window 留给别的脚本段。
+  delete globalThis.window;
+}
+
+/**
+ * 把视图的三个模块打成一份 ESM 再 import 进来（与 verify-roots.mjs / verify-git.mjs
+ * 同一做法）：lib/hostActions.ts 是「用 VSCode 打开」的调用层，lib/remoteOpen.ts 是
+ * 「在浏览器打开仓库」的调用层与两个菜单项判定，i18n.ts 是文案表。
+ *
+ * 三个模块都不碰 DOM，import 到 Node 里是安全的；只有 bridge.ts 里的 invoke 会读
+ * window.pluginBridge，那是调用时才读，所以由调用方按需挂桩。
+ */
+async function loadViewModules() {
+  const dir = mkdtempSync(join(tmpdir(), "pifm-remote-view-"));
+  const entry = join(dir, "entry.ts");
+  const out = join(dir, "bundle.mjs");
+  writeFileSync(
+    entry,
+    `export * as hostActions from ${JSON.stringify(join(here, "src", "lib", "hostActions.ts"))};\n` +
+      `export * as remoteOpen from ${JSON.stringify(join(here, "src", "lib", "remoteOpen.ts"))};\n` +
+      `export { COPY_TABLES } from ${JSON.stringify(join(here, "src", "i18n.ts"))};\n`,
+  );
+  await build({
+    entryPoints: [entry],
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    outfile: out,
+    logLevel: "silent",
+  });
+  return import(pathToFileURL(out).href);
+}
+
+ /*
+ * 8. 降级不牵连的回归（12.2，对应 design.md Correctness Property 7）。
+ *
+ * 要证明的是「新增的两个动作各自降级时，别人不受牵连」：四种降级各发生时，列目录 / 读 /
+ * 写 / 保存 / 删除 / 搜索 / `fm.watch` 这些早就存在的通道必须与全环境基线**逐项一致**。
+ *
+ * 为什么用「与基线比对」而不是逐条写死期望：写死期望只证明「现在是这个样子」，跟基线
+ * 比对才证明「没有因为这次改动而变样」——这正是本任务要的回归口径。
+ *
+ * ⚠️ 范围提醒：`fm.create` 与 `fm.rename` 在基线（7cd39c2）上就是坏的——`main.js` 的
+ * `assertValidName` 函数体被截断（`main.js:1795-1811`：函数体后面紧跟着 `entryFromStat`
+ * 的函数体，最后那句 `return` 引用了并不存在的 `rel`），两个通道必然返回
+ * `{ ok: false, code: "INTERNAL", message: "rel is not defined" }`。这**不是本次改动引入的**，
+ * 本任务也不去修它；所以下面钉住的是**失败**结论，「与改动前一致」对这两个通道就是
+ * 「仍然返回那个 INTERNAL」，绝不是期望成功。
+ */
+
+/** 第 8 节的夹具都住在这里；每一档一份全新副本，免得写过的、删过的互相污染。 */
+const degradeBase = join(base, "degrade");
+
+/**
+ * 铺一份第 8 节用的项目：一个文件 + 一个带文件的子目录，够把列目录 / 读 / 写 / 保存 /
+ * 删除 / 搜索各走一遍。
+ *
+ * `originUrl` 三态是刻意的：字符串 = 仓库且配了 origin；`null` = 仓库但没有 origin；
+ * 不给（`undefined`）= 普通目录，连 `git init` 都不跑，才算真的「不是仓库」那一档。
+ */
+function makeDegradeFixture(name, originUrl) {
+  const dir = join(degradeBase, name);
+  mkdirSync(join(dir, "sub"), { recursive: true });
+  writeFileSync(join(dir, "keep.txt"), "keep\n");
+  writeFileSync(join(dir, "sub", "note-from-sub.txt"), "sub\n");
+  // 要装成仓库、且本机真有 git：本机没有 git 时装也装不成，那样只会让这一档名不副实。
+  if (originUrl !== undefined && realGit !== null) {
+    git(dir, ["init", "-q", "-b", "main", "."]);
+    git(dir, ["config", "user.email", "t@example.com"]);
+    git(dir, ["config", "user.name", "t"]);
+    git(dir, ["add", "-A"]);
+    git(dir, ["commit", "-qm", "init"]);
+    // 只有给了地址才配 origin：`null` 这一档要的就是「仓库但没有 origin」。
+    if (originUrl) git(dir, ["remote", "add", "origin", originUrl]);
+  }
+  return dir;
+}
+
+/**
+ * 把「与本次改动无关的那些通道」驱动一遍，返回 `{ remoteReason, observed }`。
+ *
+ * `observed` 只放跨场景**应该**逐项相同的观测量：`remote` / `git` / `editor` 正是本次新增
+ * 的字段，本来就该随降级变化，记进来会让比对永远不等。`remoteReason` 单独放在外面，用途
+ * 只有一个——核对这一档的降级真的发生了，否则后面那场比对是空转。
+ *
+ * 顺序也有意：先列目录，再写、再删——列目录看到的 `git` 因此都是「干净仓库里的 null」，
+ * 与「没有 git」那一档同形，不必为了对齐再去等 git 快照的 2 秒缓存过期。
+ */
+async function driveBaselineChannels(plugin, dir) {
+  // 桩宿主的 workspace 是同一个对象：改 path 就等于换一个打开的项目。
+  workspace.path = dir;
+  const listing = await plugin.onPanelInvoke("fm.list", { path: "" });
+  const read = await plugin.onPanelInvoke("fm.read", { path: "keep.txt" });
+  const write = await plugin.onPanelInvoke("fm.write", { path: "keep.txt", text: "keep\nedited\n" });
+  // 写完再读一遍：这才叫「保存」落了盘，只看 write.ok 只说明「没报错」。
+  const saved = await plugin.onPanelInvoke("fm.read", { path: "keep.txt" });
+  const search = await plugin.onPanelInvoke("fm.search", { query: "note-from-sub", limit: 20 });
+  const watch = await plugin.onPanelInvoke("fm.watch", { since: 0 });
+  const removed = await plugin.onPanelInvoke("fm.delete", { path: "sub" });
+  // create / rename 在基线上就是坏的（见本节开头的范围提醒）：这里只记结论，不期望成功。
+  const created = await plugin.onPanelInvoke("fm.create", { parent: "", name: "brand-new.txt" });
+  const renamed = await plugin.onPanelInvoke("fm.rename", { path: "keep.txt", newName: "kept.txt" });
+
+  return {
+    // 这一档的降级成因（`noGit` / `noRepo` / `noRemote`）；「PATH 上没有 code」那一档不用它。
+    remoteReason: listing.remote?.reason ?? null,
+    // 跨场景比对的观测量：每一项都是一种早就存在的通道行为，少记一项就少一处回归面。
+    observed: {
+      // 列目录：条目名 + 是否目录（目录带一个斜杠），以及截断标记。
+      listNames: (listing.entries ?? []).map((entry) => `${entry.name}${entry.isDirectory ? "/" : ""}`).join(","),
+      listTruncated: listing.truncated === true,
+      // 读：成功与否 + 实际拿到的文本。
+      readOk: read.ok === true,
+      readText: read.text,
+      // 写 / 保存：写入成功与否 + 重新读回来的文本。
+      writeOk: write.ok === true,
+      savedText: saved.text,
+      // 搜索：命中的相对路径（夹具里只有一个够独特的名字）。
+      searchPaths: (search.matches ?? []).map((match) => match.path).join(","),
+      // 监听：这一轮问得成不成功，以及本运行时给不给可用。
+      watchOk: watch.ok === true,
+      watchAvailable: watch.available === true,
+      // 删除：成功与否，以及那个目录是不是真的没了。
+      deleteOk: removed.ok === true,
+      subGone: !existsSync(join(dir, "sub")),
+      // 新建 / 重命名的完整结论（连 message 一起记，基线那一档会另行钉死它到底是哪个故障）。
+      createVerdict: `${created.ok}/${created.code ?? ""}/${created.message ?? ""}`,
+      renameVerdict: `${renamed.ok}/${renamed.code ?? ""}/${renamed.message ?? ""}`,
+    },
+  };
+}
+
+/** 两份观测的第一处差异；没有差异返回 null（沿用 firstDifference 的 null = 无事约定）。 */
+function observationDifference(baseline, actual) {
+  for (const key of Object.keys(baseline)) {
+    // 逐字段比：不相等的第一处就是被牵连的点，报出来即可（键顺序由同一个函数决定，两边一致）。
+    if (baseline[key] !== actual[key]) return `${key}: ${JSON.stringify(baseline[key])} → ${JSON.stringify(actual[key])}`;
+  }
+  return null;
+}
+
+/**
+ * 跑一档降级：先核对降级确实发生了（没发生的话后面的比对是空转，等于没测），再把与本次
+ * 改动无关的那些通道与全环境基线逐项比对。
+ *
+ * `load` 收成一个函数是为了「机器上没有 git」那一档：挡 child_process 必须把加载与调用
+ * 一起包在那个窗口里（`node:child_process` 是惰性 require 的），由调用方决定包不包。
+ */
+async function runDegradeCase(label, load, dir, expectation, baseline) {
+  const plugin = await load();
+  const hello = await plugin.onPanelInvoke("fm.hello", {});
+  const driven = await driveBaselineChannels(plugin, dir);
+  // 「没有 code」这一档的观测量在握手响应里；其余三档看 remote 的成因码。
+  if (expectation.editorBinaryNull === true) {
+    check(`${label}：降级确实发生（editor.binary === null）`, hello.editor?.binary === null, JSON.stringify(hello.editor));
+  }
+  if (expectation.remoteReason) {
+    check(`${label}：降级确实发生（remote.reason === "${expectation.remoteReason}"）`, driven.remoteReason === expectation.remoteReason, JSON.stringify(driven.remoteReason));
+  }
+  const difference = observationDifference(baseline.observed, driven.observed);
+  check(`${label}：列目录 / 读 / 写 / 保存 / 删除 / 搜索 / fm.watch 与基线逐项一致`, difference === null, String(difference));
+}
+
+/** 12.2 降级不牵连（Correctness Property 7）：四种降级各发生时，无关通道照旧，不被牵连。 */
+async function verifyDegradationIsolation() {
+  console.log("\n8. 降级不牵连的回归（12.2）");
+
+  // 全环境基线：完整 PATH，本机有 git 的话给的是一个配了 origin 的仓库。
+  const baselinePlugin = await loadPlugin(realPath);
+  const baseline = await driveBaselineChannels(baselinePlugin, makeDegradeFixture("healthy", "git@github.com:owner/repo.git"));
+  check(
+    "基线：列目录 / 读 / 写 / 保存 / 删除 / 搜索在完整环境下都照常",
+    baseline.observed.listNames === "sub/,keep.txt" &&
+      baseline.observed.readOk &&
+      baseline.observed.writeOk &&
+      baseline.observed.savedText === "keep\nedited\n" &&
+      baseline.observed.deleteOk &&
+      baseline.observed.subGone &&
+      baseline.observed.searchPaths === "sub/note-from-sub.txt",
+    JSON.stringify(baseline.observed),
+  );
+  // 基线里那两个早就坏掉的通道：断言的是**失败**，不是期望成功（见本节开头的范围提醒）。
+  check(
+    "fm.create 仍然返回基线的既有故障（INTERNAL / rel is not defined，不是本次引入）",
+    baseline.observed.createVerdict === "false/INTERNAL/rel is not defined",
+    baseline.observed.createVerdict,
+  );
+  check(
+    "fm.rename 仍然返回基线的既有故障（INTERNAL / rel is not defined，不是本次引入）",
+    baseline.observed.renameVerdict === "false/INTERNAL/rel is not defined",
+    baseline.observed.renameVerdict,
+  );
+
+  // （一）PATH 上没有 code：探测落空那一档。夹具本身仍是配了 origin 的仓库。
+  await runDegradeCase(
+    "降级一：PATH 上没有 code",
+    () => loadPlugin(emptyDir),
+    makeDegradeFixture("no-editor", "git@github.com:owner/repo.git"),
+    { editorBinaryNull: true },
+    baseline,
+  );
+
+  // （二）机器上没有 git：只有挡住 child_process 才造得出来（与 6.6 的 noGit 同一手法）。
+  await withBlockedChildProcess(() =>
+    runDegradeCase(
+      "降级二：机器上没有 git",
+      () => loadPlugin(realPath),
+      makeDegradeFixture("no-git", "git@github.com:owner/repo.git"),
+      { remoteReason: "noGit" },
+      baseline,
+    ),
+  );
+
+  // （三）不是仓库：普通目录（夹具不跑 git init）。
+  await runDegradeCase(
+    "降级三：不是 git 仓库",
+    () => loadPlugin(realPath),
+    makeDegradeFixture("no-repo"),
+    { remoteReason: "noRepo" },
+    baseline,
+  );
+
+  // （四）仓库没有 origin：要真仓库才造得出来，本机没有 git 时跳过（跳过要看得见）。
+  if (realGit === null) {
+    skip("降级四（仓库没有 origin）：原始 PATH 上没有 git");
+  } else {
+    await runDegradeCase(
+      "降级四：仓库没有 origin",
+      () => loadPlugin(realPath),
+      makeDegradeFixture("no-origin", null),
+      { remoteReason: "noRemote" },
+      baseline,
+    );
+  }
+}
+
 try {
   mkdirSync(fakeDir, { recursive: true });
   mkdirSync(emptyDir, { recursive: true });
@@ -1223,6 +1675,14 @@ try {
     await verifyRemoteOpen();
     await verifyReadOnlyActions();
   }
+
+  // 第 7 节不依赖假脚本与 git（它只 import 视图模块），所以必定执行：
+  // 前面的硬闸即便整节跳过，也拦不住这一节的证据。
+  await verifyViewLayer();
+
+  // 第 8 节只加载插件、驱动既有通道，同样不依赖假脚本，所以放在最后：
+  // 它会把 PATH 换成别的形状，排在最末才不会干扰前面几节。
+  await verifyDegradationIsolation();
 
   // 汇总行带上跳过数：跳过不算失败、不改退出码，但必须看得见（否则 CI 上是零覆盖）。
   const verdict = failures === 0 ? "REMOTE VERIFY PASSED" : `${failures} FAILURE(S)`;

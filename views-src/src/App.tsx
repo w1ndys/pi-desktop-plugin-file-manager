@@ -12,7 +12,7 @@ import { makeT, type T } from "./i18n";
 import { resolveViewer, type ViewerMode } from "./lib/viewers";
 import { toOpenFile, withSavedContent, type OpenFile } from "./lib/openFile";
 import { openInEditor, openWithDefaultApp, revealInFileManager } from "./lib/hostActions";
-import { editorMenuState, openRepoInBrowser, remoteMenuState } from "./lib/remoteOpen";
+import { editorMenuState, editorTargetPath, openRepoInBrowser, remoteMenuState } from "./lib/remoteOpen";
 import { isExternalPath, watchHostOpenRequests, type HostOpenRequest } from "./lib/hostOpen";
 import type { DiffViewState } from "./components/GitDiffView";
 import { Tree, type DirState } from "./components/Tree";
@@ -53,6 +53,15 @@ const SEARCH_PAGE = 60;
  * 直接跳过，所以把面板切到后台不会白刷流量。
  */
 const WATCH_POLL_MS = 1200;
+
+/**
+ * 「用 VSCode 打开」被主进程拒掉的原因码里，属于「这条路径不许打开」的那几个。
+ *
+ * 它们不是编辑器出问题，而是路径本身被拒（越界 / 凭据黑名单 / 符号链接逃逸 / 送了绝对
+ * 路径 / 相对路径解不出来），与其它文件操作是同一种失败，所以走插件既有的错误横幅、
+ * 保留真实原因，不能笼统地说一句「打不开 VS Code」——那会把用户引向重装编辑器。
+ */
+const EDITOR_PATH_DENIED_CODES = ["DENIED_PATH", "ESCAPE", "SYMLINK_ESCAPE", "ABSOLUTE_PATH", "NOT_FOUND", "INVALID_PATH"];
 
 export default function App() {
   const [hostLocale, setHostLocale] = useState<HostLocale>("en");
@@ -230,6 +239,10 @@ export default function App() {
     // 概览与徽标都是「上一个 root 的」，换项目 / 换文件夹必须一起清掉。
     setGitSummary(null);
     setDiff(null);
+    // 「在浏览器打开仓库」的判定同样是「上一个 root 的」：不清掉的话，切到不是仓库的
+    // 文件夹后这一项仍然可点、悬停还写着上一个仓库的 host，要等新的一次 fm.list 回来
+    // 才纠正；反过来切进真仓库时也会被错误置灰。这里是唯一的清除点，别漏。
+    setRemote(null);
     // 监听游标也是「上一个 root 的」：留着它会漏掉新项目开头的那批变化。
     watchCursorRef.current = 0;
     setExternalChange(false);
@@ -1017,17 +1030,27 @@ export default function App() {
    * 「用 VSCode 打开」（0.9.0）：由插件主进程自己启动 code 命令行，不走宿主网关，
    * 所以目标可以是文件、目录，也可以是基点文件夹自身。
    *
-   * 失败走 toast——它只影响这一次点击，与当前打开的文件无关，不该占用插件的错误横幅。
+   * 失败分两路（design.md 的错误处理表）：路径被拒（越界 / 凭据黑名单 / symlink 逃逸 /
+   * 送了绝对路径 / 相对路径解不出来）与其它文件操作是同一种失败，走插件既有的错误横幅、
+   * 保留真实原因码；其余（命令行不在 PATH 上、Windows 上不能交给 cmd.exe 的路径）只影响
+   * 这一次点击、与当前打开的文件无关，走 toast，不占用错误横幅。
    * 这个动作也**不碰**当前打开的文件与未保存状态：用户只是想拿别处的编辑器看一眼，
    * 不该被未保存确认框拦下来（Requirement 6.6）。
    */
   const runEditorOpen = useCallback((path?: string) => {
     void openInEditor(path).catch((cause: unknown) => {
-      // 「这条路径在 Windows 上不能安全交给 cmd.exe」是用户自己能处理的一种失败
-      // （换个路径就可以），与「命令行不在 PATH 上」该说的话不一样，按原因码挑文案。
-      const code = (cause as { code?: string } | null)?.code;
-      const message = code === "EDITOR_UNSUPPORTED_PATH" ? "editorUnsupportedPath" : "editorOpenError";
-      void invoke("ui.showToast", { message: tRef.current(message) }).catch(() => {});
+      const failure = cause as { code?: string; message?: string } | null;
+      const code = failure?.code;
+      // 路径被拒：横幅里说的是「这条路径不能打开」，与其它文件操作一致（原因码经
+      // failureMessage 折成对应文案），不新增文案键。
+      if (code && EDITOR_PATH_DENIED_CODES.includes(code)) {
+        setError(failureMessage({ ok: false, code, message: failure?.message ?? code }, tRef.current));
+        return;
+      }
+      // 其余：命令行不在 PATH 上、或 Windows 上含 % 的路径——都是用户自己能处理的一次性
+      // 失败，按原因码挑一条 toast 文案即可（EDITOR_UNAVAILABLE 与其它未知码共用一条）。
+      const toastKey = code === "EDITOR_UNSUPPORTED_PATH" ? "editorUnsupportedPath" : "editorOpenError";
+      void invoke("ui.showToast", { message: tRef.current(toastKey) }).catch(() => {});
     });
   }, []);
 
@@ -1131,19 +1154,22 @@ export default function App() {
     // 下面是把目标交给外部程序的一组动作（0.9.0），与上面那组文件操作之间隔一条分隔线。
     const editorState = editorMenuState(editorAvailable, t);
     const remoteState = remoteMenuState(remote, t);
+    // 这条分隔线只在中间那段真的 push 了东西（文件右键）时才补：目录右键与空白处右键时
+    // 那段什么都没 push，再补一条就会与上面那条紧挨着——ContextMenu 逐条 map，不去重也
+    // 不去尾，用户看到的是两条并排的横线。
+    if (target && !isDir) entries.push({ kind: "separator" });
     entries.push(
-      { kind: "separator" },
       {
         kind: "item",
         // 文件 / 目录上是成员动作，空白处是项目动作（Requirement 6.1 / 6.2）。
         label: target ? t("openInVSCode") : t("openProjectInVSCode"),
         disabled: editorState.disabled,
         hint: editorState.hint,
-        // 送基点相对路径，也就是树里那个 target.path 原样送出去（与 fm.read / fm.delete
-        // 送 entry.path 一致）；空白处**不传** path，由主进程按基点文件夹自身解析。
-        // 不要用 hostActionPath：那是给宿主执行的 fs.openDefault / fs.reveal 用的，
-        // 本通道送绝对路径会被主进程按 ABSOLUTE_PATH 拒掉。
-        onPick: () => runEditorOpen(target ? target.path : undefined),
+        // 送什么路径由 editorTargetPath 一处判定：有目标就送树里那个基点相对路径
+        // （与 fm.read / fm.delete 送 entry.path 一致），空白处不带 path，由主进程按
+        // 基点文件夹自身解析。**不要**用 hostActionPath 代替：那是给宿主执行的
+        // fs.openDefault / fs.reveal 用的，本通道送绝对路径会被按 ABSOLUTE_PATH 拒掉。
+        onPick: () => runEditorOpen(editorTargetPath(target ? target.path : null)),
       },
       {
         kind: "item",
