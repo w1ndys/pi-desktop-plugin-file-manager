@@ -32,6 +32,12 @@
  *   ⑨ git 联动（0.7.0）：状态与差异来自工作区里真实存在的 git（只读子命令
  *      status / diff / rev-parse，见下面「git 状态」一节），不是自己解析 .git/**。
  *      git 缺失 / 非仓库 / 超时都只是「没有状态」，绝不牵连列目录与读写。
+ *   ⑩ 用 VS Code 打开（0.9.0）：由插件进程自己 spawn `code`（与 git 同一套惰性
+ *      require + unref 后立即返回；不走宿主网关，因为宿主没有「交给某个具体命令行」
+ *      这项能力）。只认 `PATH` 上的 `code` / `code.cmd`，**不做安装位置兜底**——
+ *      替用户猜环境，猜错时就是「我改过 PATH，插件还是打开了那个我早删掉的 VS Code」
+ *      这种没法解释的行为。Windows 上 `code.cmd` 是批处理文件、只能经 `cmd.exe` 起，
+ *      所以那一支拒掉含 `%` 的路径（`%VAR%` 在双引号内照样展开，引号屏蔽不掉）。
  *
  * 通道：视图 window.pluginBridge.invoke("fm.*", payload) → onPanelInvoke。
  *   宿主对自定义通道的转发超时是 30s（plugin-runtime.ts PLUGIN_PANEL_TIMEOUT_MS），
@@ -2592,8 +2598,221 @@ async function handleHello() {
     // 这个运行时能不能监听：不能的话视图把「自动刷新」开关显示成不可用，
     // 而不是让用户开了却永远没反应。
     watch: { available: watchSupported && fsWatchFn() !== null },
+    // VS Code 命令行探测结果：拿到 null 时视图把入口置灰并说明原因。
+    editor: { binary: await resolveEditorBinary() },
     prefs,
   };
+}
+
+// ── 打开 VS Code ─────────────────────────────────────────────────────────────
+
+/*
+ * 为什么由插件进程自己 spawn，而不是走宿主：
+ *   宿主的两个同类能力（fs.openDefault / fs.reveal）只表达「用默认应用打开」与
+ *   「在文件管理器里显示」，没有「交给某个具体命令行」这一项，所以这里和 git 是
+ *   同一套做法——自己起子进程、拿到「起得来」的信号就 unref 放走，不等它退出。
+ *
+ * 换来的是路径安全要自己扛（宿主那道闸帮不上忙），所以目标一律先过
+ * resolveInsideRoot：根内包含、凭据黑名单、realpath 逃逸校验一条都不少。
+ * POSIX 上参数走数组直传；Windows 上 code.cmd 只能经 cmd.exe，那一支拒掉含 % 的路径。
+ *
+ * 探测只认 PATH：不做安装位置兜底。把 /Applications/Visual Studio Code.app/... 或
+ * /snap/bin/code 写死进插件，等于替用户猜他的环境；猜错时的表现是「我明明改过
+ * PATH，插件还是打开了那个我早就删掉的 VS Code」，用户没法解释也没法修。PATH 是
+ * 用户自己的契约，插件只读它、不绕过它；找不到就把话说清楚（message 里点名 PATH）。
+ */
+
+/** 启动 code 的等待上限（毫秒）：只等「进程起得来」这一个信号，不等它跑完。 */
+const EDITOR_TIMEOUT_MS = 5000;
+
+/**
+ * `code` 命令行的探测结果，进程级缓存一次：
+ *   undefined = 还没探测过；null = 探测过但 PATH 上没有；字符串 = 命中的路径。
+ * 缓存不只是省开销：插件进程的 PATH 在它整个生命周期里不会变，所以这个结论不会
+ * 过期；反过来说，用户改了 PATH 必须重新加载插件才生效——这一点得说在提示里，
+ * 否则会被当成插件坏了。
+ */
+let editorBinary;
+
+/**
+ * 在 PATH 列出的目录里找 VS Code 命令行（POSIX `code`、Windows `code.cmd`），
+ * 返回命中的路径或 null。纯查找：不启动进程问 `--version`（`code` 在 macOS /
+ * Linux 上就是个 shell 脚本，为了探测而启动它纯属浪费），也不看任何安装位置。
+ */
+async function resolveEditorBinary() {
+  // 已经探测过就直接用缓存，含「探测过但没找到」这个结论。
+  if (editorBinary !== undefined) return editorBinary;
+
+  // Windows 上找 code.cmd：它是 VS Code 安装程序放进 PATH 的那一个，而 Code.exe
+  // 在安装根目录、通常不在 PATH 上。大小写交给文件系统（Windows 默认不敏感）。
+  const name = process.platform === "win32" ? "code.cmd" : "code";
+
+  for (const dir of String(process.env.PATH ?? "").split(path.delimiter)) {
+    // PATH 里的空段（连续分隔符 / 结尾分隔符）不是「当前目录」，跳过。
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    // 命中即停并缓存；这个结论在本次插件进程里不再复核。
+    if (await isEditorCandidate(candidate)) {
+      editorBinary = candidate;
+      return editorBinary;
+    }
+  }
+
+  // 一个都没命中：判为「PATH 上没有 code」，同样缓存，别每次调用都重扫一遍。
+  editorBinary = null;
+  return editorBinary;
+}
+
+/**
+ * 单个候选的命中判定。POSIX 要求可执行位；Windows 上 `code.cmd` 是批处理文件、
+ * 根本没有执行位（`X_OK` 恒真），只能判「存在且是普通文件」。
+ */
+async function isEditorCandidate(candidate) {
+  try {
+    // Windows 分支：只认文件，排除同名的目录。
+    if (process.platform === "win32") return (await fs.stat(candidate)).isFile();
+    await fs.access(candidate, fs.constants.X_OK);
+    return true;
+  } catch {
+    // stat / access 抛错只是「这个候选不行」，继续看下一个目录。
+    return false;
+  }
+}
+
+/**
+ * Windows 上启动 `code.cmd` 要用的命令解释器。优先取 `ComSpec`（系统自己声明的
+ * 那个）；没有它时按 `%SystemRoot%` 拼默认路径，这是 Windows 上唯一有契约保证的
+ * 位置。两者都拿不到的话下面的 spawn 会失败，按 EDITOR_UNAVAILABLE 报错——不猜
+ * 别的解释器，猜错就是拿用户的项目去喂一个未知程序。
+ */
+function comSpecPath() {
+  return process.env.ComSpec || path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe");
+}
+
+/**
+ * Windows 上不能安全交给 cmd.exe 的路径：`%` 是 cmd 的变量展开符，而它在双引号
+ * **内**照旧展开，`"%PATH%"` 一样会被替换。引号屏蔽不掉，所以含 `%` 的路径整条
+ * 拒掉，不试图转义（转义规则本身就是 cmd 版本的坑）。
+ */
+function isUnsafeForCmd(targetPath) {
+  return targetPath.includes("%");
+}
+
+/**
+ * 拼交给 `cmd.exe /c` 的命令串：两个路径各自双引号包裹。
+ *
+ * 之所以敢这么做：Windows 的文件名不允许 `"`，所以引号跳不出去；`&`、`|`、`>`、
+ * `<`、`^` 在双引号内都是字面量。唯一漏下的是 `%`，由 isUnsafeForCmd 提前拦掉。
+ */
+function windowsCommandLine(codeCmdPath, targetPath) {
+  return `"${codeCmdPath}" "${targetPath}"`;
+}
+
+/**
+ * 起一个脱离插件的 code 进程并立刻返回。
+ *
+ * 两个分支都保留 `shell: false`：参数只走数组，绝不让 Node 从数组拼一根命令串
+ * （那样 POSIX 上的空格与元字符就又变成语法了）。Windows 那个分支是刻意的让步
+ * ——`code.cmd` 是批处理文件，`CreateProcess` 不能直接执行它，`shell: false`
+ * 直接 spawn 会以 EINVAL 失败，只能显式启动 `cmd.exe`。
+ */
+async function spawnDetached(binary, targetPath) {
+  const spawn = gitSpawnFn();
+  // 运行时不给 child_process（非 Node 宿主 / 被裁剪的构建）时按「起不来」失败，
+  // 与 git 一侧同样的降级方式。
+  if (!spawn) throw fail("EDITOR_UNAVAILABLE", "child processes are unavailable");
+
+  let command;
+  let args;
+  if (process.platform === "win32") {
+    command = comSpecPath();
+    // /d 关掉 AutoRun（注册表里的 AutoRun 会先于我们跑一遍）；
+    // 刻意不传 /v，让 `!` 保持字面量（传了就是延迟展开打开）。
+    args = ["/d", "/s", "/c", windowsCommandLine(binary, targetPath)];
+  } else {
+    command = binary;
+    args = [targetPath];
+  }
+
+  let child;
+  try {
+    child = spawn(command, args, {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      shell: false,
+    });
+  } catch (error) {
+    // spawn 同步抛出（参数类型不对之类）：折算成视图能看的失败，别让异常裸奔。
+    throw editorSpawnError(error);
+  }
+
+  // 交还给系统：插件不持有这个进程，也不等它退出。
+  child.unref();
+  return waitForSpawn(child);
+}
+
+/**
+ * 等子进程给出「起得来」或「起不来」的信号。`'spawn'` 事件算成功——目标不存在
+ * （ENOENT）、没有执行权限（EACCES）这些只可能从 `'error'` 事件上来，所以不必等
+ * `'close'`。超时算失败但**不 kill**：进程已经交给系统了，杀它只会杀掉一个正在
+ * 打开编辑器的 code。无论成败都要清掉定时器，否则它会吊住插件进程不退出。
+ */
+function waitForSpawn(child) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (settle, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      settle(value);
+    };
+
+    const timer = setTimeout(
+      () => finish(reject, fail("EDITOR_TIMEOUT", "timed out starting the code command")),
+      EDITOR_TIMEOUT_MS,
+    );
+
+    child.once("spawn", () => finish(resolve, undefined));
+    child.once("error", (error) => finish(reject, editorSpawnError(error)));
+  });
+}
+
+/**
+ * 启动失败的折算。ENOENT / EACCES 说明「这条 code 命令起不来」（探测之后文件被删、
+ * 或者路径不可执行），统一报 EDITOR_UNAVAILABLE；其余错误原样上抛，交给 toFailure
+ * 归类成 INTERNAL——不把没见过的情况也说成「没装 VS Code」。
+ */
+function editorSpawnError(error) {
+  const code = error?.code;
+  // 两种错误都只是「起不来」，对用户是同一件事：入口不可用。
+  if (code === "ENOENT" || code === "EACCES") {
+    return fail("EDITOR_UNAVAILABLE", "the code command could not be started");
+  }
+  return error;
+}
+
+/**
+ * `fm.editor.open`：把目标路径交给 VS Code。
+ */
+async function handleEditorOpen(payload) {
+  // 省略 / 空串 = 基点文件夹自身（视图在空白处右键走的就是这条分支）。
+  const target = typeof payload?.path === "string" ? payload.path : "";
+  // 复用唯一入口守卫：根内包含、凭据黑名单、realpath 逃逸校验都在它里面，别重写。
+  const { abs } = await resolveInsideRoot(target, { mode: "read", allowRoot: true });
+
+  // Windows 上目标要经过 cmd.exe，含 % 的路径一定被展开：直接拒掉且不 spawn。
+  if (process.platform === "win32" && isUnsafeForCmd(abs)) {
+    throw fail("EDITOR_UNSUPPORTED_PATH", "this path cannot be opened on Windows");
+  }
+
+  const binary = await resolveEditorBinary();
+  // message 必须点名 PATH 与 code：用户要读到的是「PATH 里没有 code 命令」而不是
+  // 「找不到 VS Code」——后者会把人引向「我明明装了」的死胡同。
+  if (!binary) throw fail("EDITOR_UNAVAILABLE", "the code command is not on PATH");
+
+  await spawnDetached(binary, abs);
+  return { ok: true, path: abs, binary };
 }
 
 // ── 通道路由 ────────────────────────────────────────────────────────────────
@@ -2615,6 +2834,7 @@ const CHANNELS = {
   "fm.sqlite.query": handleSqliteQuery,
   "fm.git.diff": handleGitDiff,
   "fm.watch": handleWatch,
+  "fm.editor.open": handleEditorOpen,
 };
 
 async function onPanelInvoke(channel, payload) {
@@ -2676,5 +2896,12 @@ module.exports = {
     WATCH_DEBOUNCE_MS,
     SELF_WRITE_SUPPRESS_MS,
     WATCH_HISTORY_LIMIT,
+    // 用 VS Code 打开（0.9.0）：探测与 Windows 侧的两个纯函数，verify-remote.mjs
+    // 直接断言（含 % 的路径必须被拦下；纯函数在任何平台上都能跑）。
+    resolveEditorBinary,
+    isUnsafeForCmd,
+    windowsCommandLine,
+    comSpecPath,
+    EDITOR_TIMEOUT_MS,
   },
 };

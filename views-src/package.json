@@ -15,7 +15,8 @@
     "verify:viewers": "node verify-viewers.mjs",
     "verify:git": "node verify-git.mjs",
     "verify:watch": "node verify-watch.mjs",
-    "verify": "node verify-roots.mjs && node verify-jail.mjs && node verify-highlight.mjs && node verify-markdown.mjs && node verify-viewers.mjs && node verify-git.mjs && node verify-watch.mjs"
+    "verify:remote": "node verify-remote.mjs",
+    "verify": "node verify-roots.mjs && node verify-jail.mjs && node verify-highlight.mjs && node verify-markdown.mjs && node verify-viewers.mjs && node verify-git.mjs && node verify-watch.mjs && node verify-remote.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.18.4",
