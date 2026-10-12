@@ -59,7 +59,7 @@ Feature Name: open-in-editor-and-remote
     - 对随机生成的合法条目名（含各种 shell 元字符与不可打印字符），断言假 `code` 收到的参数与原名逐字节相等，即元字符从未被解释。覆盖 Requirement 1.3、5.3。
     - Windows 侧改成断言纯函数 `windowsCommandLine` 的输出：两个路径各自被一对双引号包裹、输出里除这两对引号外不再出现别的引号（引号跳不出去）；并断言含 `%` 的路径被 `isUnsafeForCmd` 拦下。覆盖 Requirement 5.3。
 
-- [ ] 4. 检查点 - 确保所有测试通过,如有疑问请询问用户
+- [x] 4. 检查点 - 确保所有测试通过,如有疑问请询问用户
   - 此时 VSCode 一侧应已可独立工作：`pnpm typecheck` 通过，`pnpm verify:remote` 通过，既有 `pnpm verify` 不回归。
 
 - [x] 5. 主进程：origin 地址规范化（`main.js`）
@@ -103,7 +103,7 @@ Feature Name: open-in-editor-and-remote
   - [x] 6.8 性质测试：两个动作全程只读（对应 Correctness Property 4）
     - 对随机路径组合反复调用两条通道，断言仓库的 `.git` 内容与工作区文件在调用前后逐字节不变，且调用过的 git 子命令只有 `remote get-url`。覆盖 Requirement 4.1、5.4。
 
-- [ ] 7. 检查点 - 确保所有测试通过,如有疑问请询问用户
+- [x] 7. 检查点 - 确保所有测试通过,如有疑问请询问用户
   - 此时主进程一侧应已全部可测：`pnpm verify:remote` 通过，既有七个校验脚本不回归。
 
 - [x] 8. 视图调用层（`views-src/src/lib/`）
@@ -136,21 +136,21 @@ Feature Name: open-in-editor-and-remote
   - [x] 10.2 把新增键纳入既有的键位对齐断言
     - 在 `verify-remote.mjs` 里断言 en / zh 两份键集合完全一致，并断言上述 12 个键两种语言都有——沿用 `verify-git.mjs` 第 6 节既有的做法与理由（少一个中文键，界面上会突然冒一句英文，而 tsc 抓不到）。覆盖 Requirement 6.7。
 
-- [ ] 11. 检查点 - 确保所有测试通过,如有疑问请询问用户
+- [x] 11. 检查点 - 确保所有测试通过,如有疑问请询问用户
   - 此时功能应已完整：`pnpm typecheck` 与 `pnpm verify`（七个既有 + `verify:remote`）全部通过。
 
-- [ ] 12. 回归核对与元数据同步
-  - [ ] 12.1 核对既有校验脚本对 `fm.list` 新形状的断言
+- [x] 12. 回归核对与元数据同步
+  - [x] 12.1 核对既有校验脚本对 `fm.list` 新形状的断言
     - `verify-jail.mjs` 与 `verify-git.mjs` 里所有读 `fm.list` 响应的地方过一遍；新增字段是纯追加，不应有脚本失败，但若某个断言对响应对象做了整体比对就需要跟着更新。覆盖 Requirement 4.11 的回归面。
-  - [ ] 12.2 降级不牵连的回归用例（对应 Correctness Property 7）
+  - [x] 12.2 降级不牵连的回归用例（对应 Correctness Property 7）
     - ⚠️ **范围提醒**：`fm.create` 与 `fm.rename` 在基线（`7cd39c2`）里就是坏的——`main.js` 的 `assertValidName` 函数体被截断，两个通道必然返回 `{ ok: false, code: "INTERNAL", message: "rel is not defined" }`（已实测）。这不属本次功能，**不要在这里顺手修**；本任务的「与改动前一致」就是「仍然坏着」。把这条如实写进汇报，修不修由用户决定。
     - 断言 `editor.binary === null`、无 git、非仓库、无 origin 这四种降级各自发生时，列目录、读写、保存、删除、搜索与 `fm.watch` 的行为与改动前一致。覆盖 Correctness Property 7。
-  - [ ] 12.3 同步 README 与 CHANGELOG
+  - [x] 12.3 同步 README 与 CHANGELOG
     - 另在「校验」一节写明 `verify-remote.mjs` 的 **Windows 覆盖缺口**：本功能的 Windows 分支（`cmd.exe` 剥引号 + `windowsVerbatimArguments` 那两层）**没有在真 Windows 上验证过**，只做了纯函数层面的往返断言；且假 `code.cmd` 用批处理 `echo` 记账对 `& | > < ^ %` 与换行是有损的，这些条目在 Windows 上会 SKIP。真机验证待补，别让读者以为 Windows 已经验过。
     - `README.md` 的「功能」一节补两个入口、「数据与安全」一节补 `shell.openExternal` 这次权限新增与两项动作的边界、「已知限制」一节写清三条：① 浏览器打开只落到仓库首页，不定位到具体文件；② 「用 VSCode 打开」要求 `code` 命令在 `PATH` 上，插件**不做安装位置兜底**（找不到就提示补 `PATH`，改了 `PATH` 需重新加载插件）；③ Windows 上插件调用的是 `code.cmd`，因此要经过 `cmd.exe`，含 `%` 的路径无法打开（`%VAR%` 会被展开）。
     - `CHANGELOG.md` 与 `manifest.json` 的 `changelog` 字段按仓库既有格式追加本版条目。
 
-  - [ ] 12.4 重新构建视图产物并把 `views/` 一起提交
+  - [x] 12.4 重新构建视图产物并把 `views/` 一起提交
     - `views/` 是**入库的构建产物**（README「开发」一节：产物输出到 `../views`，宿主加载 `views/index.html`），不是临时目录。任务 1、8、9、10 改的都是 `views-src/src/` 的源码，不重新构建的话宿主加载的仍是旧产物，面板里根本看不到新菜单项——功能等于没做。
     - 在 `views-src` 下跑 `pnpm build`（`vite build`，输出到 `../views`，`emptyOutDir: true` 会先清空），然后确认 `views/assets/index.js` 与 `views/index.html` 的变化一并提交。
     - 验证产物确实包含新代码：在 `views/assets/index.js` 里搜 `fm.editor.open` 与 `fm.remote.open` 两个字符串，必须命中。
