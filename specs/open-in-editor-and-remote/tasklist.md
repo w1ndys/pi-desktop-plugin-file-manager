@@ -4,7 +4,7 @@ Feature Name: open-in-editor-and-remote
 
 > 说明：本次实施**执行全部任务**（含测试与校验），子任务均无 `*` 标记。任务 1–3 完成 VSCode 一侧，5–6 完成仓库一侧，8–10 接界面；4、7、11 是检查点，做完停下等确认，不自动串到下一段。测试与校验沿用仓库既有惯例（`views-src/verify-*.mjs` + 桩宿主驱动真实 `main.js`），新脚本必须挂进 `pnpm verify` 串联命令。
 
-- [ ] 1. 扩展通道契约与类型（`views-src/src/lib/rpc.ts`）
+- [x] 1. 扩展通道契约与类型（`views-src/src/lib/rpc.ts`）
   - 在 `channels`（L379）追加 `editorOpen: "fm.editor.open"` 与 `remoteOpen: "fm.remote.open"`；本文件是通道契约的唯一真相来源，任何一侧改字段都从这里开始。
   - 新增 `EditorOpenRequest` / `EditorOpenResponse`、`RemoteOpenResponse`，失败分支复用既有的 `Failure`（L108）形状。
   - `HelloResponse`（L151）追加 `editor: EditorCapability`（`binary: string | null`）；`ListResponse` 追加 `remote: RemoteCapability`，并定义 `RemoteReason = "noRepo" | "noRemote" | "notOpenable" | "noGit"`。
@@ -127,10 +127,10 @@ Feature Name: open-in-editor-and-remote
     - 断言「空白处右键不带 path」与「文件右键送绝对路径」两条分支各自送出的参数。覆盖 Requirement 6.1、6.2。
 
 - [ ] 10. 界面文案（`views-src/src/i18n.ts`）
-  - [ ] 10.1 在 `COPY_TABLES`（L10）的 `en` 与 `zh` 两份里各追加 11 个键
-    - `openInVSCode`、`openProjectInVSCode`、`editorUnavailable`、`editorOpenError`、`openRemote`、`openRemoteHint`（带 `{host}` 占位）、`remoteNoRepo`、`remoteNoRemote`、`remoteNotOpenable`、`remoteNoGit`、`remoteOpenError`；文案取设计文档 4.4 节的表。覆盖 Requirement 6.7。
+  - [ ] 10.1 在 `COPY_TABLES`（L10）的 `en` 与 `zh` 两份里各追加 12 个键
+    - `openInVSCode`、`openProjectInVSCode`、`editorUnavailable`、`editorOpenError`、`editorUnsupportedPath`、`openRemote`、`openRemoteHint`（带 `{host}` 占位）、`remoteNoRepo`、`remoteNoRemote`、`remoteNotOpenable`、`remoteNoGit`、`remoteOpenError`；文案逐条取设计文档 4.4 节的表（以该表为准，不要少键）。覆盖 Requirement 6.7。
   - [ ] 10.2 把新增键纳入既有的键位对齐断言
-    - 在 `verify-remote.mjs` 里断言 en / zh 两份键集合完全一致，并断言上述 11 个键两种语言都有——沿用 `verify-git.mjs` 第 6 节既有的做法与理由（少一个中文键，界面上会突然冒一句英文，而 tsc 抓不到）。覆盖 Requirement 6.7。
+    - 在 `verify-remote.mjs` 里断言 en / zh 两份键集合完全一致，并断言上述 12 个键两种语言都有——沿用 `verify-git.mjs` 第 6 节既有的做法与理由（少一个中文键，界面上会突然冒一句英文，而 tsc 抓不到）。覆盖 Requirement 6.7。
 
 - [ ] 11. 检查点 - 确保所有测试通过,如有疑问请询问用户
   - 此时功能应已完整：`pnpm typecheck` 与 `pnpm verify`（七个既有 + `verify:remote`）全部通过。
@@ -143,3 +143,8 @@ Feature Name: open-in-editor-and-remote
   - [ ] 12.3 同步 README 与 CHANGELOG
     - `README.md` 的「功能」一节补两个入口、「数据与安全」一节补 `shell.openExternal` 这次权限新增与两项动作的边界、「已知限制」一节写清三条：① 浏览器打开只落到仓库首页，不定位到具体文件；② 「用 VSCode 打开」要求 `code` 命令在 `PATH` 上，插件**不做安装位置兜底**（找不到就提示补 `PATH`，改了 `PATH` 需重新加载插件）；③ Windows 上插件调用的是 `code.cmd`，因此要经过 `cmd.exe`，含 `%` 的路径无法打开（`%VAR%` 会被展开）。
     - `CHANGELOG.md` 与 `manifest.json` 的 `changelog` 字段按仓库既有格式追加本版条目。
+
+  - [ ] 12.4 重新构建视图产物并把 `views/` 一起提交
+    - `views/` 是**入库的构建产物**（README「开发」一节：产物输出到 `../views`，宿主加载 `views/index.html`），不是临时目录。任务 1、8、9、10 改的都是 `views-src/src/` 的源码，不重新构建的话宿主加载的仍是旧产物，面板里根本看不到新菜单项——功能等于没做。
+    - 在 `views-src` 下跑 `pnpm build`（`vite build`，输出到 `../views`，`emptyOutDir: true` 会先清空），然后确认 `views/assets/index.js` 与 `views/index.html` 的变化一并提交。
+    - 验证产物确实包含新代码：在 `views/assets/index.js` 里搜 `fm.editor.open` 与 `fm.remote.open` 两个字符串，必须命中。
