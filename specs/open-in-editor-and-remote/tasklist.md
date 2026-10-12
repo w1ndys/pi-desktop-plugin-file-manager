@@ -154,3 +154,35 @@ Feature Name: open-in-editor-and-remote
     - `views/` 是**入库的构建产物**（README「开发」一节：产物输出到 `../views`，宿主加载 `views/index.html`），不是临时目录。任务 1、8、9、10 改的都是 `views-src/src/` 的源码，不重新构建的话宿主加载的仍是旧产物，面板里根本看不到新菜单项——功能等于没做。
     - 在 `views-src` 下跑 `pnpm build`（`vite build`，输出到 `../views`，`emptyOutDir: true` 会先清空），然后确认 `views/assets/index.js` 与 `views/index.html` 的变化一并提交。
     - 验证产物确实包含新代码：在 `views/assets/index.js` 里搜 `fm.editor.open` 与 `fm.remote.open` 两个字符串，必须命中。
+
+---
+
+## 实施后的修正：探测加上「用户登录 shell 的 PATH」
+
+**日期**：2026-10-12（全部 12 个任务完成、真机验证时发现）
+
+**问题**：装上面板后，「用 VSCode 打开」永久置灰，提示「PATH 里没有 code 命令」——而用户机器上
+`code` 明明在 `/opt/homebrew/bin/code`。查实：**PI-Desktop 的所有进程（含插件进程）看到的 `PATH` 是
+`/usr/bin:/bin:/usr/sbin:/sbin`**，即 macOS launchd 给 GUI 程序的默认值；用户登录 shell 的 `PATH` 才有
+`/opt/homebrew/bin`。也就是说任务 3 里「只认 PATH」这条决策，在 macOS 上等价于**默认永远不可用**，
+还反过来告诉用户「你没有 code」。当初的理由（「PATH 是用户自己的契约，插件不该绕过它」）在 GUI 程序上
+前提就不成立。
+
+**改法**：`resolveEditorBinary` 加**第二个来源**——插件进程的 `PATH` 落空后，起一次 `$SHELL -ilc`
+读用户登录 shell 的 `PATH`，用同一套判定再扫。**仍然不写死任何安装路径**（用户当初那条原则保住了，
+变的只是「读对了那份 PATH」）。边界：只读、只跑一次、`-ilc`、标记包住 PATH 以容忍 rc 横幅、
+3 秒超时与 64 KiB 输出上限**都要 kill**、非 0 退出判失败、绝不抛异常。
+
+**同步改动**：
+
+- `main.js`：`loginShellPath()` / `resolveLoginShell()` / `captureCommand()` / `findEditorIn()`，
+  重写 `resolveEditorBinary()`；`internals` 多导出几个给测试用。
+- `views-src/src/i18n.ts`：`editorUnavailable` 中英两份改成「插件进程的 PATH 与登录 shell 的 PATH 都没有」。
+- `views-src/verify-remote.mjs`：新增 `makeStubShell` / `makeRawStubShell`，`loadPlugin` 增加第二个参数
+  接管「登录 shell 的 PATH」，原依赖本机环境的用例改成确定性；新增第 1b 节 10 条断言。
+- `requirements.md` R2（AC1/5/6 改写 + 新增 AC8）、`design.md` 3.1（整节重写）、`README.md` 已知限制②、
+  `manifest.json` 三处 safetyNotes、`CHANGELOG.md` 与 `manifest.json` 的 changelog 同步。
+
+**验证**：`pnpm verify` 八脚本全绿共 357 条断言；`tsc --noEmit` 通过；`PluginCheck` 62 个文件无警告。
+另用探针复现 app 的 `PATH`（`/usr/bin:/bin:/usr/sbin:/sbin`）：真实登录 shell 下 `editor.binary` 得到
+`/opt/homebrew/bin/code`（修复生效），假 shell 输出空 PATH 时仍为 `null`（证明没有猜安装位置）。

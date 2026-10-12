@@ -53,13 +53,14 @@ Updated: 2026-10-12
 
 #### Acceptance Criteria
 
-1. WHEN 插件加载，系统 SHALL 在 `PATH` 环境变量列出的各个目录中探测 VS Code 命令行，并 SHALL 把探测结果放进首次握手响应（`fm.hello`）。
+1. WHEN 插件加载，系统 SHALL 在插件进程的 `PATH` 环境变量列出的各个目录中探测 VS Code 命令行；IF 该次探测未命中且当前平台为 POSIX，系统 SHALL 再读取一次用户登录 shell 的 `PATH` 并在其中探测，且 SHALL 把最终探测结果放进首次握手响应（`fm.hello`）。
 2. WHEN 系统探测到 VS Code 命令行，系统 SHALL 在本次插件进程生命周期内记住该可执行文件路径。
 3. WHILE 探测结果表示未找到 VS Code 命令行，系统 SHALL 把「用 VSCode 打开」渲染为不可用状态，并 SHALL 给出可读的原因文案。
 4. IF 视图在未找到命令行的情况下请求打开，系统 SHALL 以 `EDITOR_UNAVAILABLE` 失败响应拒绝，并 SHALL 附带原因文案。
-5. IF 系统在 `PATH` 列出的各个目录中都没有找到可用的 VS Code 命令行，系统 SHALL 判定为未找到，并 SHALL 不尝试任何其它安装位置、不读取注册表或应用清单、不猜测安装路径。
-6. WHEN 系统判定未找到，系统 SHALL 在原因文案中说明是 `PATH` 环境变量里没有 `code` 命令，并 SHALL 说明补救方式是把 VS Code 的命令行目录加入 `PATH`。
+5. IF 两个来源的所有目录中都没有找到可用的 VS Code 命令行，系统 SHALL 判定为未找到，并 SHALL 不尝试任何其它安装位置、不读取注册表或应用清单、不猜测安装路径。
+6. WHEN 系统判定未找到，系统 SHALL 在原因文案中说明插件进程的 `PATH` 与用户登录 shell 的 `PATH` 里都没有 `code` 命令，并 SHALL 说明补救方式是把 VS Code 的命令行目录加入 `PATH` 后重新加载插件。
 7. WHEN 系统在 Windows 上探测，系统 SHALL 查找 `code.cmd`，并 SHALL 通过 `cmd.exe /d /s /c` 启动它（`code.cmd` 是批处理文件，Windows 的 `CreateProcess` 不能直接执行）。
+8. WHEN 系统读取用户登录 shell 的 `PATH`，系统 SHALL 只启动一次该 shell 且只读取它的 `PATH`，并 SHALL 不修改任何 shell 配置或文件；IF 该次读取在 3 秒内没有结束、或输出超过 64 KiB、或该 shell 以非 0 状态退出，系统 SHALL 终止该进程并把这次探测判为未命中。
 
 ### Requirement 3：在浏览器打开仓库首页
 

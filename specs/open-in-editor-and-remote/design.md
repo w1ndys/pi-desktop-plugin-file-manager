@@ -128,22 +128,36 @@ export type RemoteReason =
 
 ### 3. 主进程新增
 
-#### 3.1 VS Code 探测：只认 `PATH`（Requirement 2）
+#### 3.1 VS Code 探测：两个 `PATH` 来源（Requirement 2）
 
-探测**只在 `PATH` 上做**，不做任何安装位置兜底：
+探测**只看 `PATH`**，但看**两个**：插件进程自己的，以及用户登录 shell 的。**不做任何安装位置兜底**：
 
 ```js
-/** PATH 里找 code（Windows 上是 code.cmd）；找不到返回 null。纯查找，不启动进程。 */
+/** 找 code（Windows 上是 code.cmd）：两个 PATH 来源，命不中就 null。只读、不启动 code。 */
 async function resolveEditorBinary() { … }
 ```
 
-规则：
+来源与顺序：
 
-- 取 `process.env.PATH`，按平台分隔符（POSIX `:`、Windows `;`）切分，逐个目录找可执行文件。Windows 上找的是 **`code.cmd`**（大小写不敏感）。
-- 命中判定：POSIX 用 `fs.access(binary, X_OK)`；Windows 上 `code.cmd` 没有执行位，`fs.stat` 判存在且是文件即可。**不真正启动进程**去问 `--version`——`code` 在 macOS / Linux 上是个 shell 脚本，为了探测而启动它纯属浪费。
-- 探测结果（命中路径或 `null`）**按插件进程缓存一次**。这不只是省开销：插件进程的 `PATH` 在进程生命周期内不会变，所以缓存不会失效；用户改了 `PATH` 需要重新加载插件才生效——这一点写在错误提示与 README 里，别让人以为插件坏了。
+1. **插件进程自己的 `PATH`**（`process.env.PATH`）：正常情况在这里就命中，**零额外开销**。按平台分隔符（POSIX `:`、Windows `;`）切分，逐个目录找可执行文件；Windows 上找的是 **`code.cmd`**（大小写不敏感）。
+2. **用户登录 shell 的 `PATH`**（仅 POSIX，且只在第 1 步落空后才做）：起一次 `$SHELL -ilc`（回退 `/bin/zsh`、`/bin/bash`）问它的 `PATH`，用同一套判定再扫一遍。
 
-**为什么不做兜底**（刻意的决策，不是遗漏）：把 `/Applications/Visual Studio Code.app/…`、`/snap/bin/code` 这类路径写死进插件，等于替用户猜他的环境；猜错时会出现「我明明改过 `PATH`，这插件还是打开了那个我已经删掉的 VS Code」这种没法解释的行为。`PATH` 是用户自己的契约，插件只读它、不绕过它。找不到时的正确做法是把话说清楚（Requirement 2.6），让用户去补 `PATH`。
+命中判定：POSIX 用 `fs.access(binary, X_OK)`；Windows 上 `code.cmd` 没有执行位，`fs.stat` 判存在且是文件即可。**不真正启动 `code`** 去问 `--version`——它本身就是个 shell 脚本，为了探测而启动纯属浪费。
+
+**为什么必须有第 2 个来源**（这是实测踩出来的，不是理论顾虑）：macOS 从 Dock 启动的 GUI 程序继承的是 **launchd 的默认 `PATH`**——实测 PI-Desktop 全部进程（含插件进程）看到的都是 `/usr/bin:/bin:/usr/sbin:/sbin`，而用户登录 shell 的 `PATH` 里才有 `/opt/homebrew/bin`，VS Code 的 `code` 通常就装在那儿。也就是说「只认进程 PATH」在 macOS 上等价于**默认永远不可用**，还会反过来骗用户说他没有 `code`。用户自己的 `PATH` 才是那条契约，所以去问一次他的 shell——**这仍然是读 `PATH`，不是猜安装位置**。
+
+第 2 个来源的边界（都在实现里写死）：
+
+- **只读**：起一次 shell、问一句 `PATH`、拿完就放走；不改配置、不碰 rc 文件；命令串是**写死的常量**，不含任何来自路径或用户的插值。
+- **`-ilc`（登录 + 交互）**：`brew shellenv` 有人写在 `~/.zprofile`、有人写在 `~/.zshrc`，两个都要覆盖。
+- **一对标记包住 `PATH`**：rc 文件可能打印横幅/提示，只有在输出里找得到成对标记才取中间那段，找不到就判失败（输出不可信）。
+- **3 秒超时 + 输出上限 64 KiB，两者都 kill 子进程**：超时判失败但这次**要杀**——它是我们自己起的探测进程，留着就是泄漏；输出超限同理，免得某个 rc 文件把内存吃满。
+- **非 0 退出也判失败**：那条 shell 没正常跑完，它的输出不能信。
+- **绝不抛异常**：任何失败都返回 `null`，探测失败最多是这个功能不可用，不该牵握手。
+
+**为什么不做安装位置兜底**（刻意的决策，不是遗漏）：把 `/Applications/Visual Studio Code.app/…`、`/opt/homebrew/bin/code`、`/snap/bin/code` 这类路径写死进插件，等于替用户猜他的环境；猜错时会出现「我明明改过 `PATH`，这插件还是打开了那个我已经删掉的 VS Code」这种没法解释的行为。`PATH` 是用户自己的契约，插件只读它、不绕过它（第 2 个来源读的也是 `PATH`，只是读对了那一份）。两个来源都没有时，正确做法是把话说清楚（Requirement 2.6），让用户去补 `PATH`。
+
+探测结果（命中路径或 `null`）**按插件进程缓存一次**：进程自己的 `PATH` 在生命周期内不变，登录 shell 那份也不会中途变，所以缓存不会过期；反过来说，**改了 `PATH` 或 shell 配置都要重新加载插件**才生效——这一点写在错误提示与 README 里，别让人以为插件坏了。代价是每个插件进程首次探测多花约 0.3 秒（只在第 1 步落空时才付）。
 
 **Windows 上为什么必须经 `cmd.exe`**：`code.cmd` 是批处理文件，Windows 的 `CreateProcess` 不能直接执行它——`spawn(codeCmd, [path], { shell: false })` 会以 `EINVAL` 失败。所以 Windows 分支显式启动 `cmd.exe`（`process.env.ComSpec` 优先，回退 `%SystemRoot%\System32\cmd.exe`；两者都缺席就直接判 `EDITOR_UNAVAILABLE`，不猜别的解释器）并传 `["/d", "/s", "/c", "\"<命令串>\""]`，同时带上 `windowsVerbatimArguments: true`。这是对「参数不经 shell」这条不变量的**明确让步**，代价与缓解措施都在 3.2 与不变量 2 里写死了：双引号包裹、外层再加一对引号、`/d` 关 AutoRun、不传 `/v` 保持 `!` 为字面量，并拒绝含 `%` 的路径。POSIX 分支完全不受影响，仍是参数数组直传。
 

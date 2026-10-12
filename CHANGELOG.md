@@ -18,10 +18,14 @@
   结果与 git 快照共用 2 秒缓存）。
 - **三条边界写清楚**：① 浏览器打开**只落到仓库首页**，不定位到具体文件、也不表示行号——因此不必猜
   host 属于哪家托管服务，自建 GitLab / Gitea / 内网 git 全都自然可用；② 「用 VSCode 打开」要求
-  `code` 命令在 `PATH` 上，插件**只在 `PATH` 上查找、不做任何安装位置兜底**（不写死
+  `code` 命令在 `PATH` 上，插件按**两个来源**查找：① 先看**插件进程自己的 `PATH`**；② 那里没有时才问一次
+  **用户登录 shell 的 `PATH`**（`$SHELL -ilc`，3 秒超时、输出有上限、只读、只跑一次，不改任何配置）。
+  为什么要第二步：macOS 从 Dock 启动的 GUI 程序拿到的是 launchd 的默认 `PATH`
+  （`/usr/bin:/bin:/usr/sbin:/sbin`），里面没有 `/opt/homebrew/bin` 或 `/usr/local/bin`，而 `code` 通常就
+  装在那儿——这一步是把你**自己配的 `PATH`** 读出来，而**不是**替你去猜安装位置：插件仍然**不写死**
   `/Applications/Visual Studio Code.app/…`、`/opt/homebrew/bin/code`、`/snap/bin/code` 这类路径，
-  也不读注册表或应用清单），找不到就提示把 VS Code 的命令行目录加进 `PATH`，**改了 `PATH` 需要重新
-  加载插件**才生效；③ Windows 上调的是 `code.cmd`，因此要经过 `cmd.exe`，而 `%VAR%` 在双引号**内**
+  也不读注册表或应用清单；两个来源都找不到就提示把 VS Code 的命令行目录加进 `PATH`，**改了 `PATH` 或
+  shell 配置需要重新加载插件**才生效；③ Windows 上调的是 `code.cmd`，因此要经过 `cmd.exe`，而 `%VAR%` 在双引号**内**
   也会被展开，**含 `%` 的路径无法打开**（直接拒绝并说明原因，不做转义）。
 - 两个动作都**不写文件、不写仓库**，插件自己**不发起任何网络请求**；不可用时菜单项置灰并写出原因
   （`PATH` 上没有 `code` / 不是 git 仓库 / 没有配置 `origin` / `origin` 不是网页地址 /
