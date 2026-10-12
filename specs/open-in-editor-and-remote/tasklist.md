@@ -62,16 +62,16 @@ Feature Name: open-in-editor-and-remote
 - [ ] 4. 检查点 - 确保所有测试通过,如有疑问请询问用户
   - 此时 VSCode 一侧应已可独立工作：`pnpm typecheck` 通过，`pnpm verify:remote` 通过，既有 `pnpm verify` 不回归。
 
-- [ ] 5. 主进程：origin 地址规范化（`main.js`）
-  - [ ] 5.1 实现纯函数 `normalizeRemoteUrl(raw)`
+- [x] 5. 主进程：origin 地址规范化（`main.js`）
+  - [x] 5.1 实现纯函数 `normalizeRemoteUrl(raw)`
     - 返回 `{ ok: true, url }` 或 `{ ok: false, reason: "notOpenable" }`，不联网、不查 host 属于哪家托管服务，只做形态归一。
-    - 处理顺序：① 含控制字符（`U+0000`–`U+001F`、`U+007F`）直接拒绝；② scp 形态 `user@host:path` 换成 `https://host/path`（与 `http://host:port` 的区分：`://` 之前不含 `/` 且冒号后不是纯数字）；③ `ssh://` / `git://` 换协议为 `https://` 并丢弃端口；④ `http://` / `https://` 保留原协议与端口；⑤ `file://` 与裸本地路径（`/`、盘符、UNC 开头）拒绝；⑥ 去掉结尾的 `/` 与结尾的 `.git`；⑦ 结果必须是可解析的 `http(s)` URL 且 host 非空。
+    - 处理顺序（与 `design.md` 3.3 的表一致，别按直觉重排）：⓪ 先 `String(raw).trim()` 剪首尾空白，剪完为空则拒；① 含**内嵌**控制字符（`U+0000`–`U+001F`、`U+007F`）拒绝；② `file://` 与裸本地路径（`/` 开头、盘符、UNC）拒绝——**必须排在 scp 之前**，否则 `C:/x/y` 会被当成 host 是 `c`；③ `scheme://` 后紧跟 `/` 或 `\`（多一个斜杠）拒绝——否则 URL 解析器会把路径第一段当成主机名，凭空空捏出一个域名；④ scp 形态 `[user@]host:path` 换成 `https://host/path`（与 `host:port` 的区分：`://` 之前不含 `/`，且冒号后那一段不是纯数字）；⑤ `ssh://` / `git://` 换协议为 `https://` 并丢弃端口；⑥ `http://` / `https://` 保留原协议与端口；⑦ 循环剪掉结尾的 `/` 与 `.git`；⑧ **丢掉 userinfo**（`user@` / `user:password@`），内嵌凭据不得进浏览器地址栏与历史；⑨ 结果必须是可解析的 `http(s)` URL 且 host 非空——**要用最终地址再喂一次 `new URL` 复验**（`ssh` / `git` 的 host 允许百分号编码，换协议后可能反而解析不了）。
     - 多级路径（如 `group/sub/repo`）原样保留；丢弃查询串与锚点。覆盖 Requirement 4.2–4.7、5.5。
 
-  - [ ] 5.2 纯函数夹具
+  - [x] 5.2 纯函数夹具
     - 覆盖设计文档列出的全部形态：`git@github.com:owner/repo.git`、`ssh://git@gitlab.com:2222/owner/repo.git`（端口丢弃）、`git://…`、`https://…`、`http://git.internal:8080/owner/repo.git`（协议与端口都保留）、自建 GitLab 的多级路径、结尾有无 `.git` 与 `/` 的各种组合、本地路径与 `file://`、**含 userinfo 的地址（`https://token@github.com/o/r` 必须把 `token@` 丢掉）**、含控制字符、空串、无 host、带查询串与锚点。覆盖 Requirement 4.2–4.7。
 
-  - [ ] 5.3 性质测试：只产出 `http(s)` 绝对地址（对应 Correctness Property 3）
+  - [x] 5.3 性质测试：只产出 `http(s)` 绝对地址（对应 Correctness Property 3）
     - 对随机生成的输入串，断言输出要么被拒绝，要么是可解析的 `http(s)` URL 且 host 非空——不可能出现其它协议。覆盖 Requirement 4.7、5.5、5.6。
 
 - [ ] 6. 主进程：打开仓库、列表判定与通道路由（`main.js`）

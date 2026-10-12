@@ -236,14 +236,18 @@ function normalizeRemoteUrl(raw) { … }
 
 | 步骤 | 处理 |
 |---|---|
-| 1 | 含控制字符（`U+0000`–`U+001F`、`U+007F`）→ `notOpenable` |
-| 2 | `scp` 形态 `user@host:path` → `https://host/path`（注意 `host:path` 与 `http://host:port` 的区分：`://` 之前不含 `/`、且冒号后不是纯数字，才按 scp 处理） |
-| 3 | `ssh://` / `git://` → 换协议为 `https://`，**丢弃端口**（SSH 端口与 HTTPS 无关） |
-| 4 | `http://` / `https://` → 原样保留协议与端口 |
-| 5 | `file://`、裸本地路径（`/`、盘符、UNC 开头）→ `notOpenable` |
-| 6 | 去掉结尾的 `/` 与结尾的 `.git` |
-| 7 | 去掉 URL 里的 **userinfo**（`user@` / `user:password@`）：`git remote get-url` 可能带回内嵌凭据（`https://token@github.com/o/r`），那条地址一旦送进浏览器就会出现在地址栏与历史里。首页不需要凭据，整段丢掉 |
-| 8 | 结果必须是可解析的 `http(s)` URL 且 host 非空，否则 `notOpenable` |
+| 0 | 先 `String(raw).trim()` 剪掉首尾空白：`git config` 里可能留着空格或换行。剪完是空串就直接 `notOpenable` |
+| 1 | 含控制字符（`U+0000`–`U+001F`、`U+007F`）→ `notOpenable`（剪过首尾之后，这里抓的是**内嵌**的控制字符） |
+| 2 | `file://`、裸本地路径（`/` 开头、盘符 `C:\`／`C:/`、UNC 的 `\\` 开头）→ `notOpenable`。**这一步必须排在 scp 之前**：`C:/Users/me/repo` 的冒号左边是单个字母、右边不是纯数字，照 scp 规则会被拼成 `https://c/Users/me/repo`，把盘符当成主机名 |
+| 3 | `scheme://` 之后**紧跟 `/` 或 `\`** → `notOpenable`。`https:///owner/repo` 这种多一个斜杠的写法会被 URL 解析器把路径第一段当成主机名（`https://owner/repo`），冒出一个凭空捏造的域名 |
+| 4 | `scp` 形态 `[user@]host:path` → `https://host/path`（与 `host:port` 的区分：`://` 之前不含 `/`，且冒号后那一段**不是纯数字**才按 scp 处理） |
+| 5 | `ssh://` / `git://` → 换协议为 `https://`，**丢弃端口**（SSH 端口与 HTTPS 无关） |
+| 6 | `http://` / `https://` → 原样保留协议与端口 |
+| 7 | 去掉结尾的 `/` 与结尾的 `.git`（两者可能叠加，循环剪到不再变化） |
+| 8 | 去掉 URL 里的 **userinfo**（`user@` / `user:password@`）：`git remote get-url` 可能带回内嵌凭据（`https://token@github.com/o/r`），那条地址一旦送进浏览器就会出现在地址栏与历史里。首页不需要凭据，整段丢掉 |
+| 9 | 结果必须是可解析的 `http(s)` URL 且 host 非空。**要用最终地址再喂一次 `new URL` 复验**：`ssh` / `git` 是非 special scheme、host 允许百分号编码，换成 `https://` 之后可能反而解析不了（`ssh://a%20b/o/r` → 主机名解码后含空格）。复验失败同样 `notOpenable` |
+
+顺序里的第 2、3 步是**实现细节上的必要提前**，不是把规格的行序搞乱：盘符与多斜杠这两类必须赶在 scp 之前判掉，否则会被 scp 规则吃掉、产出一条看似合法却指向错误主机的地址。
 
 **刻意不猜平台**：不判断 host 是不是 `github.com` / `gitlab.com` / `bitbucket.org`，也不按平台生成不同的路径格式。既然链接只落到仓库首页，就不存在任何平台相关的路径拼接，自建 GitLab、Gitea、企业内网 git 全都自然可用。这是「只开首页」这个决策换来的最大简化。
 
