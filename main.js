@@ -2843,6 +2843,204 @@ async function handleEditorOpen(payload) {
   return { ok: true, path: abs, binary };
 }
 
+// ── 远程仓库首页（0.9.0） ────────────────────────────────────────────────────────
+
+/*
+ * 为什么只归一到「仓库首页」这一个粒度：
+ *   origin 写成 `git@github.com:owner/repo.git` 还是 `ssh://git@host:2222/o/r.git`，
+ *   说的是同一个网页仓库的两种写法。既然只落到首页，就不必判断 host 属于哪家托管
+ *   服务（github / gitlab / bitbucket 各有各的文件路径规则）——自建 GitLab、Gitea、
+ *   内网 git 于是全都自然可用。不猜平台，就不替用户假设他的环境。
+ *
+ * 为什么必须是一个纯函数：
+ *   输入是仓库里那一行字符串，输出马上要交给宿主去开（`shell.openExternal`）。
+ *   这段逻辑必须能在离线夹具里被逐条钉住，所以它不联网、不读文件、不起进程，
+ *   也不碰任何模块状态。
+ *
+ * 凭据：`git remote get-url` 可能带回内嵌凭据（`https://token@github.com/o/r`），
+ *   那条地址进了浏览器就会留在地址栏与历史里，所以 userinfo 整段丢掉。
+ *
+ * 规则顺序以 design.md 3.3 那张表为准：控制字符 → scp → ssh/git → http(s) →
+ *   本地路径（顺序上提前，理由见 isLocalRemote 的盘符说明）→ 剪尾部 →
+ *   丢 userinfo → 校验。
+ */
+
+/** 不可打开的唯一结论：reason 只有一种，视图按它查文案。 */
+function remoteNotOpenable() {
+  return { ok: false, reason: "notOpenable" };
+}
+
+/**
+ * 串里有没有控制字符（`U+0000`–`U+001F`、`U+007F`）？
+ * 判的是剪掉首尾空白之后**中间**的部分：内嵌的 `\n` 与 NUL 会被抓出来，
+ * 而结尾的一个换行只是空白、不算控制字符。
+ */
+function hasControlCharacter(text) {
+  for (let index = 0; index < text.length; index += 1) {
+    // 逐码元看：控制字符全在 BMP 低段，charCodeAt 够用，不必按码点迭代。
+    const code = text.charCodeAt(index);
+    // C0 段：内嵌的 `\n` / `\r` / `\t` 都落在这一段里。
+    if (code <= 0x1f) return true;
+    // DEL：唯一一个不在 C0 段里、却同属控制字符的码点。
+    if (code === 0x7f) return true;
+  }
+  // 整串扫完都没有：这串里没有控制字符。
+  return false;
+}
+
+/**
+ * 这串是不是本地路径（`file://` 或裸路径）？是的话就不该被当成 URL 去拼。
+ *
+ * 必须抢在 scp 分支**之前**判：`C:\Users\me\repo` 冒号后第一段不是纯数字，
+ * 照 scp 规则会被读成「host 是 C」，拼出一条根本不存在的地址——这是盘符陷阱。
+ */
+function isLocalRemote(text) {
+  // file:// 是本地路径的 URL 形态，单独认出来，别让它落到协议分支里。
+  if (text.toLowerCase().startsWith("file:")) return true;
+  // 以 `/` 开头：POSIX 绝对路径（`//host/share` 这种 UNC 展开式也一并算在内）。
+  if (text.startsWith("/")) return true;
+  // 以 `\\` 开头：Windows UNC 路径，形如 `\\server\share\repo`。
+  if (text.startsWith("\\\\")) return true;
+  // 盘符形态：单个字母 + 冒号 + 分隔符（`C:\repo`、`C:/repo`），详见上面的陷阱说明。
+  if (/^[A-Za-z]:[\\/]/.test(text)) return true;
+  // 其余都不是本地路径。
+  return false;
+}
+
+/**
+ * `scheme://` 之后还紧跟一个斜杠（`https:///owner/repo`、`ssh:///o/r`、`https://\\owner\repo`）？
+ *
+ * 这类写法绝不能交给 URL 解析器：WHATWG 会把 `://` 之后的**所有**斜杠都吃掉，于是把路径
+ * 第一段当成主机名——`https:///owner/repo` 解出来是 `https://owner/repo`，host 变成
+ * `owner`，一条凭空捏造出来的域名（很可能是别人家的域名），接着就会交给宿主的
+ * `shell.openExternal` 去打开。所以先在形态上拒掉，连解析都不进。反斜杠也算：解析器同样吃它。
+ */
+function hasSlashRightAfterScheme(text) {
+  // 认「协议 + `://`」，紧跟的字符是 `/` 或 `\` 就判为多斜杠形态。
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[\\/]/.test(text);
+}
+
+/**
+ * 抓 scp 形态 `[user@]host:path`：命中返回 `{ host, path }`，不是这个形态返回 null。
+ *
+ * 只看**第一个**冒号。冒号后第一段是纯数字时不算 scp——那更像 `host:port/path`，
+ * 而 scp 的 `host:path` 里没有端口这回事；误当 scp 会拼出一条带两个冒号的怪地址。
+ */
+function parseScpRemote(text) {
+  // 带 `://` 的一律归协议分支，这里只认「没有协议」的形态。
+  if (text.includes("://")) return null;
+  // 连冒号都没有就无从分割：`owner/repo` 这种无 host 的串走这里。
+  const colon = text.indexOf(":");
+  if (colon < 0) return null;
+  // 冒号左边是 `[user@]host`、右边是 path；任何一边为空都不成形。
+  const left = text.slice(0, colon);
+  const right = text.slice(colon + 1);
+  if (!left || !right) return null;
+  // 冒号左边出现 `/` 说明这是一条普通路径而不是 `host:path`，别硬按 scp 处理。
+  if (left.includes("/")) return null;
+  // userinfo 在这里就丢掉：`git@` 只是登录名，不是仓库位置的一部分（规则 7）。
+  const at = left.lastIndexOf("@");
+  const host = at >= 0 ? left.slice(at + 1) : left;
+  // `git@:o/r`：`@` 左右都空，host 是空串，拼不出地址。
+  // （`@github.com:o/r` 不在这条上被拒：左边那段是 `@github.com`，host 取到 `github.com`，
+  //   按 scp 读成 `https://github.com/o/r`——只有 `@` 没有用户名，不等于「没有 host」。）
+  if (!host) return null;
+  // 冒号后第一段纯数字 = `host:port/path` 的写法，不当 scp（见上面的说明）。
+  if (/^[0-9]+$/.test(right.split("/")[0])) return null;
+  // scp 的 `/abs/path` 写法指服务器上的绝对路径，开头的 `/` 要剥掉，
+  // 否则拼出来是 `https://host//abs/path`，多一个斜杠。
+  return { host, path: right.replace(/^\/+/, "") };
+}
+
+/**
+ * 剪掉仓库路径结尾的 `/` 与 `.git`。两者可能同时出现、还可能叠加
+ * （`…/repo.git/`），所以循环剪到不再变化为止。
+ */
+function trimRepoPathSuffix(pathname) {
+  let result = pathname;
+  for (;;) {
+    const before = result;
+    // 结尾的 `/`：`https://host/o/r.git/` 这类写法不该留在地址里（规则 6）。
+    while (result.endsWith("/")) result = result.slice(0, -1);
+    // 结尾的 `.git`：git 的约定后缀，首页地址不需要它（规则 6）。
+    if (result.endsWith(".git")) result = result.slice(0, -4);
+    // 这一轮没改掉任何字符就说明收敛了，退出，否则会一直转下去。
+    if (result === before) return result;
+  }
+}
+
+/**
+ * origin 地址 → 仓库首页。返回 `{ ok: true, url }` 或 `{ ok: false, reason: "notOpenable" }`。
+ * 不联网、不读文件、不碰全局状态、不起进程，也不判 host 属于哪家托管服务：只做形态
+ * 归一，所以自建服务与内网地址一视同仁。
+ */
+function normalizeRemoteUrl(raw) {
+  // 首尾空白先剪掉：git 配置里可能留着空格或换行，剪掉之后才是真实地址。
+  const text = String(raw).trim();
+  // 剪完是空的就没有任何形态可判，直接判不可打开。
+  if (!text) return remoteNotOpenable();
+  // 控制字符（内嵌 `\n`、NUL、DEL）会让地址在下游被截断或改写，先拒（规则 1）。
+  if (hasControlCharacter(text)) return remoteNotOpenable();
+  // 本地路径与 file:// 不是网页，也不该被当成 host 去猜（规则 5）。
+  if (isLocalRemote(text)) return remoteNotOpenable();
+  // 顺序上紧跟本地路径：多斜杠形态一旦进了解析器就会被它把路径第一段当 host，凭空造出一个
+  // 域名（见 hasSlashRightAfterScheme），所以必须在拼 URL 之前就拦掉。
+  if (hasSlashRightAfterScheme(text)) return remoteNotOpenable();
+
+  // scp 形态没有协议，先摘成 `{ host, path }`，再拼成 `https://…` 走同一套 URL 解析，
+  // 免得为它另写一份「拼 host、拼 path」的字符串处理。
+  const scp = parseScpRemote(text);
+  // 既没有 `://` 又不像 scp：这种串没有可用的 host，直接拒（`owner/repo` 走这里）。
+  if (!scp && !text.includes("://")) return remoteNotOpenable();
+  const candidate = scp ? `https://${scp.host}/${scp.path}` : text;
+
+  let parsed;
+  try {
+    // 交给 URL 解析：合法性、host 小写、punycode、路径的百分号编码都由它办。
+    parsed = new URL(candidate);
+  } catch {
+    // 畸形串（没有 host、只有协议、host 里有非法字符）解析不了 = 不可打开。
+    return remoteNotOpenable();
+  }
+
+  // 协议已经被 URL 归一成小写，所以 `HTTPS://…` 与 `https://…` 在这里是同一条路。
+  const scheme = parsed.protocol;
+  const isWeb = scheme === "http:" || scheme === "https:";
+  const isSsh = scheme === "ssh:" || scheme === "git:";
+  // 这四个之外一律拒（规则 8）。带 `://` 的 ftp 能解析出 host，所以它确实会走到这一句——协议白名单
+  // 是单独一道守卫，不靠「解析不成功」顺手拦下；不带 `://` 的 `javascript:` / `data:` 落不到这里，
+  // 它们被 scp 分支读成 `https://javascript/…` 这类单标签主机的地址（见 parseScpRemote 的说明）。
+  if (!isWeb && !isSsh) return remoteNotOpenable();
+  // host 为空说明这条地址落不到任何主机上：走到这一句的是「只有协议、没有主机」的串
+  // （`https://`、`ssh://`）。`git:/o/r`、`@github.com:o/r` 到不了这里——它们没有 `://`、
+  // 冒号左边那段又像主机名，早被 scp 分支读成 `https://git/o/r` / `https://github.com/o/r`，
+  // 这与 git 自己对 `host:path` 的解释一致；单标签主机（`git`）那条地址大概率打不开但无害。
+  if (!parsed.hostname) return remoteNotOpenable();
+
+  // ssh / git 换协议并丢端口：SSH 的 2222 与网页端口无关，照搬只会打不开（规则 3、4）；
+  // http(s) 则原样保留协议与端口（规则 4）。
+  const finalScheme = isSsh ? "https" : scheme.slice(0, -1);
+  const finalPort = isSsh ? "" : parsed.port;
+  const pathname = trimRepoPathSuffix(parsed.pathname);
+
+  // 只用 hostname / port / pathname 手工拼回：userinfo（token、user:pass）与查询串、
+  // 锚点都不在这三样里，于是「凭据不进浏览器」是结构上保证的，不靠事后过滤（规则 7、8）。
+  const portSuffix = finalPort ? `:${finalPort}` : "";
+  const finalUrl = `${finalScheme}://${parsed.hostname}${portSuffix}${pathname}`;
+
+  // 最后把**拼好的地址**再喂一次解析：ssh / git 是非 special scheme，它的 host 允许百分号编码，
+  // 换成 `https://` 之后反而可能解析不了（`ssh://a%20b/o/r` → 主机名解码后含空格，是 forbidden
+  // host code point）。不复验就会漏出一条不可解析的地址：既违反「只产出可解析的 http(s) 地址」，
+  // 也会被宿主的地址白名单拒掉，最后只给用户一句说不清原因的失败。
+  try {
+    // 解析得动就说明这条地址真能用；返回值不用，只关心它抛不抛。
+    void new URL(finalUrl);
+  } catch {
+    return remoteNotOpenable();
+  }
+  return { ok: true, url: finalUrl };
+}
+
 // ── 通道路由 ────────────────────────────────────────────────────────────────
 
 const CHANNELS = {
@@ -2931,5 +3129,8 @@ module.exports = {
     windowsCommandLine,
     comSpecPath,
     EDITOR_TIMEOUT_MS,
+    // origin 地址规范化（0.9.0）：纯形态归一，不联网、也不判 host 属于哪家托管服务；
+    // verify-remote.mjs 第 5 节用离线夹具直接断言它的输出与拒绝理由。
+    normalizeRemoteUrl,
   },
 };

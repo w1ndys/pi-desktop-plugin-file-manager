@@ -1,7 +1,8 @@
 /**
- * 用 VS Code 打开（0.9.0）：`code` 探测、启动参数与路径守卫的离线校验。
+ * 用 VS Code 打开 / 在浏览器打开仓库（0.9.0）：`code` 探测、启动参数与路径守卫、
+ * origin 地址规范化的离线校验。
  *
- * 四组，对应 tasklist 的 3.4 / 3.5 / 3.6 / 3.7：
+ * 五组，对应 tasklist 的 3.4 / 3.5 / 3.6 / 3.7 / 5.2 / 5.3：
  *   ① 探测：只认 PATH——命中（PATH 最前放一个假的 code 命令行）、未命中（PATH 指向一个
  *      不含 code 的空目录）、不做安装位置兜底（本机装了 VS Code 也照样判未找到）。
  *   ② 参数安全与项目根：根内路径逐字节送达假脚本；省略 path 落到基点文件夹；
@@ -9,6 +10,9 @@
  *   ③ 性质：通道只接受基点内的路径（design.md Correctness Property 1）。
  *   ④ 性质：参数不经 shell（design.md Correctness Property 2），Windows 侧的命令串
  *      用纯函数断言。
+ *   ⑤ origin 地址规范化（Requirement 4）：纯计算夹具 + 性质断言（design.md
+ *      Correctness Property 3）。它不碰 PATH、不起进程，所以放在**第一个**执行：
+ *      后面几组一旦因为假脚本没命中而整节跳过，这一组的证据仍然完整。
  *
  * 观测手法：临时目录里写一个假的可执行脚本，它把自己收到的每个参数逐行追加到日志
  * 文件；把该目录放在 PATH 最前再加载 main.js，`resolveEditorBinary` 命中的就是它，
@@ -620,12 +624,233 @@ async function verifyNoShell() {
   check("含空格与 & 的普通路径不误伤", internals.isUnsafeForCmd("C:\\Program Files\\a&b\\c.txt") === false);
 }
 
+/**
+ * 5.2 的夹具表：输入 → 期望结果（`expected: null` = 必须被拒）。
+ *
+ * 形态与结果逐条取自 design.md 3.3 那张表与「层 1：纯函数夹具」清单；label 写的是
+ * 这一条在钉什么规则，失败时不必回头翻文档。用固定清单而不是随机：失败要能复现。
+ */
+const REMOTE_URL_CASES = [
+  { label: "scp 带 user", input: "git@github.com:owner/repo.git", expected: "https://github.com/owner/repo" },
+  { label: "scp 不带 user", input: "github.com:owner/repo", expected: "https://github.com/owner/repo" },
+  { label: "scp 多级路径（自建 GitLab）", input: "git@gitlab.company.com:group/sub/repo.git", expected: "https://gitlab.company.com/group/sub/repo" },
+  { label: "scp 结尾 /", input: "git@github.com:owner/repo.git/", expected: "https://github.com/owner/repo" },
+  { label: "ssh 带端口（端口丢弃）", input: "ssh://git@gitlab.com:2222/owner/repo.git", expected: "https://gitlab.com/owner/repo" },
+  { label: "ssh 不带端口", input: "ssh://git@gitlab.com/owner/repo.git", expected: "https://gitlab.com/owner/repo" },
+  { label: "git:// 换协议", input: "git://github.com/owner/repo.git", expected: "https://github.com/owner/repo" },
+  { label: "https 去 .git", input: "https://github.com/owner/repo.git", expected: "https://github.com/owner/repo" },
+  { label: "https 本来没有 .git", input: "https://github.com/owner/repo", expected: "https://github.com/owner/repo" },
+  { label: "https 结尾 /", input: "https://github.com/owner/repo/", expected: "https://github.com/owner/repo" },
+  { label: "https 结尾 .git 与 / 叠加", input: "https://github.com/owner/repo.git/", expected: "https://github.com/owner/repo" },
+  { label: "http 保留协议与端口", input: "http://git.internal:8080/owner/repo.git", expected: "http://git.internal:8080/owner/repo" },
+  { label: "http 不带端口", input: "http://git.internal/owner/repo.git", expected: "http://git.internal/owner/repo" },
+  { label: "大写协议", input: "HTTPS://github.com/owner/repo.git", expected: "https://github.com/owner/repo" },
+  { label: "userinfo 丢弃（token@）", input: "https://token@github.com/owner/repo.git", expected: "https://github.com/owner/repo" },
+  { label: "userinfo 丢弃（user:pass@）", input: "https://user:pass@git.internal/o/r", expected: "https://git.internal/o/r" },
+  { label: "查询串与锚点丢弃", input: "https://github.com/owner/repo?x=1#y", expected: "https://github.com/owner/repo" },
+  { label: "首尾空白先剪掉（含结尾换行）", input: "  git@github.com:owner/repo.git \n", expected: "https://github.com/owner/repo" },
+  { label: "本地绝对路径被拒", input: "/Users/x/repo", expected: null },
+  { label: "file:// 被拒", input: "file:///srv/repo", expected: null },
+  { label: "盘符路径被拒（反斜杠）", input: "C:\\Users\\x\\repo", expected: null },
+  { label: "盘符路径被拒（正斜杠）", input: "C:/Users/x/repo", expected: null },
+  { label: "UNC 路径被拒", input: "\\\\server\\share\\repo", expected: null },
+  { label: "相对路径（无 host）被拒", input: "owner/repo", expected: null },
+  { label: "空串被拒", input: "", expected: null },
+  { label: "纯空白被拒", input: "   \t ", expected: null },
+  { label: "单个 - 被拒", input: "-", expected: null },
+  { label: "内嵌换行被拒", input: "git@github.com:owner/\nrepo", expected: null },
+  { label: "内嵌 NUL 被拒", input: "https://github.com/owner/repo\u0000", expected: null },
+  { label: "结尾 DEL 被拒", input: "git@github.com:owner/repo.git\u007f", expected: null },
+  { label: "协议之外被拒（ftp://）", input: "ftp://github.com/owner/repo.git", expected: null },
+  { label: "冒号后是纯数字（host:port，不是 scp）被拒", input: "git@github.com:2222/o/r", expected: null },
+  { label: "只有 host 没有路径被拒", input: "git@github.com:", expected: null },
+  { label: "只有 :// 被拒", input: "://", expected: null },
+  { label: "只有协议被拒", input: "https://", expected: null },
+  // 下面五条是给两道「零覆盖」守卫补的真输入：上面那些「无 host」「非网页协议」的条目
+  // 要么被 URL 解析器自己拒掉、要么在 scp 分支就被改写成 `https://…`，从来没走到 main.js
+  // 里的协议白名单与最终地址复验。这五条能穿透过去，把那两道守卫删掉就会变红。
+  { label: "协议白名单：ftp 能解析出 host，但不是 http(s)/ssh/git 被拒", input: "ftp://github.com/owner/repo", expected: null },
+  { label: "最终地址复验：ssh host 带百分号编码，换 https:// 后不可解析被拒", input: "ssh://a%20b/o/r", expected: null },
+  { label: "多斜杠形态被拒：https:///owner/repo（解析器会把 owner 当 host）", input: "https:///owner/repo", expected: null },
+  { label: "多斜杠形态被拒：ssh:///o/r（非 special scheme 同样多斜杠）", input: "ssh:///o/r", expected: null },
+  { label: "多斜杠形态被拒：反斜杠形态（解析器把 \\ 也吃掉）", input: "https://\\\\owner\\repo", expected: null },
+];
+
+/**
+ * 5.3 性质测试的固定输入清单（不用随机：失败要能复现）。
+ *
+ * 混的是各种畸形与极端写法，只为逼问同一个问题——输出会不会漏出非 http(s) 的东西。
+ * 清单必须同时含有「该被接受」与「该被拒绝」两类，否则这条性质会退化成空话
+ * （下面的第二条 check 就守着这一点）。
+ */
+const REMOTE_URL_PROPERTY_INPUTS = [
+  // 空与纯空白。
+  "",
+  " ",
+  "\t",
+  "\n",
+  "   \t \n ",
+  // 只有分隔符与冒号：没有 host 可拼。
+  "-",
+  "--",
+  ":",
+  "::",
+  ":::",
+  "://",
+  "//",
+  "///",
+  // 只有协议、连主机都没有（`http:` 这种非 special scheme 根本拼不出 host）。
+  "http:",
+  "https:",
+  "http://",
+  "https://",
+  "ssh://",
+  "git://",
+  "ftp://",
+  // `scheme://` 之后多一个斜杠：解析器会把路径第一段当 host（`https:///owner/repo` 解出
+  // `https://owner/repo`，凭空捏造一个域名），现在由形态守卫拦下；非 special scheme 同理。
+  "https:///owner/repo",
+  "ssh:///o/r",
+  // 只有主机名、没有路径，或者连主机都没有：没有主机可落，全部被拒。
+  "owner/repo",
+  "github.com",
+  "github.com:",
+  "git@github.com:",
+  "git@:o/r",
+  // 没有 `://`、冒号左边那段像主机名的串按 scp 读：`@github.com:o/r` 里 `@` 左边没有用户名，
+  // host 取到 `github.com`，读成 `https://github.com/o/r`；`git:/o/r` 只有一个斜杠，host 取到
+  // `git`，读成 `https://git/o/r`。后者是单标签主机、大概率打不开，但与 git 对 `host:path`
+  // 的解释一致、也不指向别人的域名，所以不拦（拦了反而与 git 行为不一致）。
+  "@github.com:o/r",
+  "git:/o/r",
+  // `host:port/path` 的写法：冒号后是纯数字，不是 scp。
+  "git@github.com:2222/o/r",
+  "git.internal:8080/o/r",
+  // 冒号左边像主机名、又没有 `://`：这几条同样走 scp 分支，被读成 `https://<第一段>/<其余>`
+  // （例如 `https://javascript/alert(1)`）。它们不是「非网页协议」——走到协议白名单那一句的
+  // 只有带 `://` 的串；这里的结果是单标签主机的 https 地址，打不开但无害，所以不拦。
+  "javascript:alert(1)",
+  "data:text/html,<b>x</b>",
+  "mailto:a@b.c",
+  "vbscript:msgbox(1)",
+  // Windows 盘符与 UNC：应被拒，且绝不能被读成 scp 的 host。
+  "C:\\Users\\x\\repo",
+  "C:/Users/x/repo",
+  "c:\\repo",
+  "\\\\server\\share\\repo",
+  "file:///srv/repo",
+  "file://C:/repo",
+  // 内嵌控制字符（首尾空白之外的位置）。
+  "git@github.com:o/\nrepo",
+  "https://github.com/o/r\u0000",
+  "https://github.com/o/r\u007f",
+  "\u0001https://github.com/o/r",
+  // host 里有非法字符与空格。
+  "https://git hub.com/o/r",
+  "git@git hub.com:o/r",
+  // 超长输入。
+  `https://github.com/${"a".repeat(5000)}.git`,
+  `git@github.com:${"x/".repeat(2000)}repo.git`,
+  // Unicode 域名：punycode 归一或直接拒绝都行，但结果不许是别的东西。
+  "https://例え.jp/o/r.git",
+  "git@例え.jp:o/r.git",
+  // 大写协议、默认端口、多层结尾。
+  "HTTPS://github.com/owner/repo.git",
+  "HTTP://git.internal/o/r",
+  "https://github.com/o/r.git.git",
+  "https://github.com/o/r/.git",
+];
+
+/**
+ * 结果串是不是 host 非空的 http(s) 绝对地址？是就返回解析结果，否则返回 null。
+ * 与 main.js 同口径：能被 `new URL` 解析、协议恰为 http 或 https、hostname 非空。
+ */
+function parseWebUrl(url) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    // 解析不了就不是合格地址。
+    return null;
+  }
+  // 只有 http / https 算合格：别的协议绝不能从这里漏出去。
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  // host 为空说明这条地址落不到任何主机上。
+  if (!parsed.hostname) return null;
+  return parsed;
+}
+
+/**
+ * 5.2 / 5.3 origin 地址规范化（Requirement 4）。
+ *
+ * 这一组的对象是一个纯函数（输入字符串、输出地址或拒绝理由），所以它不碰 git、
+ * 不起进程、也不依赖 PATH：纯计算断言，跑得飞快。也正因为它跟假脚本、临时仓库
+ * 都无关，它在脚本里第一个执行——后面几组一旦因为假脚本没命中而整节跳过，
+ * 这一组的证据仍然完整。
+ */
+function verifyRemoteNormalization() {
+  console.log("5. origin 地址规范化（Requirement 4）");
+
+  // 5.2 夹具：逐条对齐 design.md 3.3 的结果。
+  for (const item of REMOTE_URL_CASES) {
+    const result = internals.normalizeRemoteUrl(item.input);
+    // 拒绝分支：只查 ok === false 守不住「必须被拒」——reason 也得是唯一那一种。
+    if (item.expected === null) {
+      check(
+        `${item.label}：${JSON.stringify(item.input)} → 被拒（notOpenable）`,
+        result.ok === false && result.reason === "notOpenable",
+        JSON.stringify(result),
+      );
+      continue;
+    }
+    // 通过分支：地址必须逐字符等于表里那一列，多一个斜杠都算错。
+    check(
+      `${item.label}：${JSON.stringify(item.input)} → ${item.expected}`,
+      result.ok === true && result.url === item.expected,
+      JSON.stringify(result),
+    );
+  }
+
+  // 5.3 性质（Correctness Property 3）：输出要么被拒，要么是能解析的 http(s) 地址
+  // 且 host 非空——绝不可能出现别的协议。
+  // 逐条打印会在报告里刷出几十行 ok，所以这里把不合格的输入收集起来一次性断言；
+  // 真有 offender 时它们会被完整写进 detail，信息一条都不丢。
+  const offenders = [];
+  let accepted = 0;
+  let refused = 0;
+  for (const input of REMOTE_URL_PROPERTY_INPUTS) {
+    const result = internals.normalizeRemoteUrl(input);
+    // 被拒是合法结果，但理由必须恰好是 notOpenable（别的 reason 视图没有文案）。
+    if (result.ok === false) {
+      refused += 1;
+      if (result.reason !== "notOpenable") offenders.push(`${JSON.stringify(input)} → ${JSON.stringify(result)}`);
+      continue;
+    }
+    accepted += 1;
+    // 成功分支必须是真能解析的 http(s) 地址，且 host 非空。
+    if (!parseWebUrl(result.url)) offenders.push(`${JSON.stringify(input)} → ${JSON.stringify(result)}`);
+  }
+  check(
+    `性质：${REMOTE_URL_PROPERTY_INPUTS.length} 条畸形 / 极端输入要么被拒，要么是 host 非空的 http(s) 地址`,
+    offenders.length === 0,
+    offenders.join(" | "),
+  );
+  // 再钉一次清单本身：两种结果都得真的出现过，否则上面那条断言是空转。
+  check(`性质清单同时覆盖两侧（接受 ${accepted} 条 / 拒绝 ${refused} 条）`, accepted > 0 && refused > 0, `accepted=${accepted} refused=${refused}`);
+  // 这一组跑在最前，结束时空一行，下一组的标题才不会跟上面最后一条粘在一起
+  // （其它组自己带了前导换行）。
+  console.log("");
+}
+
 try {
   mkdirSync(fakeDir, { recursive: true });
   mkdirSync(emptyDir, { recursive: true });
   mkdirSync(project, { recursive: true });
   fakeCodePath = makeFakeCode();
 
+  // 纯函数那一组放在最前：它不碰 PATH、不起进程、也不依赖假脚本能不能命中，
+  // 所以后面几组即便整节跳过，它也已经把证据留全了（见文件头 ⑤）。
+  await verifyRemoteNormalization();
   await verifyDetection();
   await verifyArgumentsAndRoot();
   await verifyInsideRootOnly();
