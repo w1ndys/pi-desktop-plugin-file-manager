@@ -106,34 +106,34 @@ Feature Name: open-in-editor-and-remote
 - [ ] 7. 检查点 - 确保所有测试通过,如有疑问请询问用户
   - 此时主进程一侧应已全部可测：`pnpm verify:remote` 通过，既有七个校验脚本不回归。
 
-- [ ] 8. 视图调用层（`views-src/src/lib/`）
-  - [ ] 8.1 `hostActions.ts` 追加 `openInEditor(path?)`
+- [x] 8. 视图调用层（`views-src/src/lib/`）
+  - [x] 8.1 `hostActions.ts` 追加 `openInEditor(path?)`
     - 既有两条（`openWithDefaultApp` / `revealInFileManager`）保持不动；复用同一个错误折算惯例（`{ ok: false }` 与异常统一抛错），调用方只写一个 `catch`。覆盖 Requirement 1.1、2.4。
-  - [ ] 8.2 新增 `remoteOpen.ts`，导出 `openRepoInBrowser()`
+  - [x] 8.2 新增 `remoteOpen.ts`，导出 `openRepoInBrowser()`
     - 单独成文件而不是塞进 `hostActions.ts`：后者的注释把「由宿主代为执行、受 `manifest.fs.read` 约束、只对文件有效」这份契约写死了，而本通道不受 `manifest.fs` 约束、也不只对文件有效。覆盖 Requirement 3.1。
-  - [ ] 8.3 修掉两处因新增 `shell.openExternal` 权限而变成假话的既有注释
+  - [x] 8.3 修掉两处因新增 `shell.openExternal` 权限而变成假话的既有注释
     - `views-src/src/lib/linkSafety.ts` 的文件头注释写着「本插件没有申报 shell.openExternal 权限」，`views-src/src/App.tsx` 的 `onLink` 上方注释（约 L976-977）同样这么写——任务 2 给 manifest 加上该权限之后，这两句话直接变成假话。行为不用改（`onLink` 仍只弹 toast），但理由必须重写：改成「本插件申报了 shell.openExternal，但预览里的链接仍不导航——视图一旦离开插件页面就回不来，所以点击的语义是把地址告诉用户」。
     - 顺带在 `App.tsx` 里搜一遍是否还有别处引用「没有 shell.openExternal」这个理由，一并改掉。
 
-- [ ] 9. 视图菜单与状态（`views-src/src/App.tsx`）
-  - [ ] 9.1 新增 `editorAvailable` 与 `remote` 两个状态
+- [x] 9. 视图菜单与状态（`views-src/src/App.tsx`）
+  - [x] 9.1 新增 `editorAvailable` 与 `remote` 两个状态
     - `editorAvailable` 从 `fm.hello` 的 `editor.binary` 推导，写在既有 `setWatchAvailable(hello.watch.available)`（L311）同一处。
     - `remote` 从 `fm.list` 响应取（`setRemote(response.remote)`），与既有的 `setGitSummary(response.git)`（L370）同构、放在同一个 `useCallback` 里。覆盖 Requirement 4.11、6.3、6.4。
-  - [ ] 9.2 新增 `runEditorOpen(path?)` 与 `runRemoteOpen()`
+  - [x] 9.2 新增 `runEditorOpen(path?)` 与 `runRemoteOpen()`
     - 放在既有 `runHostAction`（L990）旁；失败走 `ui.showToast`，用各自专属的失败文案，不占用插件的错误横幅。覆盖 Requirement 6.5。
     - 两者都不得触碰当前打开的文件与未保存状态，也不得弹未保存确认框。覆盖 Requirement 6.6。
-  - [ ] 9.3 `menuEntries`（L1016）追加一组分隔线与两个菜单项
+  - [x] 9.3 `menuEntries`（L1016）追加一组分隔线与两个菜单项
     - 标签随目标切换（文件/目录为成员动作，空白处为项目动作）；`disabled` 分别跟 `editorAvailable` 与 `remote.available` 走，`hint` 在不可用时给出对应原因、可用时给出将打开的 host。覆盖 Requirement 6.1–6.4。
     - 文件 / 目录送**基点相对路径**，也就是树里那个 `target.path` 原样送出去（与 `fm.read` / `fm.delete` 送 `entry.path` 完全一致）；空白处右键时不传 `path`，交由主进程的 `currentRoot()` 解析成基点文件夹自身。**不要**用 `lib/roots.ts` 的 `hostActionPath`：那是给宿主代为执行的 `fs.openDefault` / `fs.reveal` 用的（宿主只收工作区相对路径、按主文件夹解析，所以基点不是主文件夹时必须送绝对路径）；本通道由插件自己解析路径，`resolveInsideRoot` 会以 `ABSOLUTE_PATH` 拒掉绝对路径（已实测）。覆盖 Requirement 1.2、1.5。
     - 两项都沿用既有菜单的键盘规则（`↑↓` / `Home` / `End` / `Enter` / `Escape`、禁用项跳过焦点），不需要改 `ContextMenu.tsx`。覆盖 Requirement 6.8。
-  - [ ] 9.4 视图判定用例
+  - [x] 9.4 视图判定用例
     - 断言 `editor.binary === null` 与 `remote.reason` 的四种取值下，两个菜单项的 `disabled` 与 `hint` 文案正确；可用时不再禁用且给出 host。覆盖 Requirement 6.3、6.4。
     - 断言「空白处右键不带 path」与「文件右键送绝对路径」两条分支各自送出的参数。覆盖 Requirement 6.1、6.2。
 
-- [ ] 10. 界面文案（`views-src/src/i18n.ts`）
-  - [ ] 10.1 在 `COPY_TABLES`（L10）的 `en` 与 `zh` 两份里各追加 12 个键
+- [x] 10. 界面文案（`views-src/src/i18n.ts`）
+  - [x] 10.1 在 `COPY_TABLES`（L10）的 `en` 与 `zh` 两份里各追加 12 个键
     - `openInVSCode`、`openProjectInVSCode`、`editorUnavailable`、`editorOpenError`、`editorUnsupportedPath`、`openRemote`、`openRemoteHint`（带 `{host}` 占位）、`remoteNoRepo`、`remoteNoRemote`、`remoteNotOpenable`、`remoteNoGit`、`remoteOpenError`；文案逐条取设计文档 4.4 节的表（以该表为准，不要少键）。覆盖 Requirement 6.7。
-  - [ ] 10.2 把新增键纳入既有的键位对齐断言
+  - [x] 10.2 把新增键纳入既有的键位对齐断言
     - 在 `verify-remote.mjs` 里断言 en / zh 两份键集合完全一致，并断言上述 12 个键两种语言都有——沿用 `verify-git.mjs` 第 6 节既有的做法与理由（少一个中文键，界面上会突然冒一句英文，而 tsc 抓不到）。覆盖 Requirement 6.7。
 
 - [ ] 11. 检查点 - 确保所有测试通过,如有疑问请询问用户
@@ -143,6 +143,7 @@ Feature Name: open-in-editor-and-remote
   - [ ] 12.1 核对既有校验脚本对 `fm.list` 新形状的断言
     - `verify-jail.mjs` 与 `verify-git.mjs` 里所有读 `fm.list` 响应的地方过一遍；新增字段是纯追加，不应有脚本失败，但若某个断言对响应对象做了整体比对就需要跟着更新。覆盖 Requirement 4.11 的回归面。
   - [ ] 12.2 降级不牵连的回归用例（对应 Correctness Property 7）
+    - ⚠️ **范围提醒**：`fm.create` 与 `fm.rename` 在基线（`7cd39c2`）里就是坏的——`main.js` 的 `assertValidName` 函数体被截断，两个通道必然返回 `{ ok: false, code: "INTERNAL", message: "rel is not defined" }`（已实测）。这不属本次功能，**不要在这里顺手修**；本任务的「与改动前一致」就是「仍然坏着」。把这条如实写进汇报，修不修由用户决定。
     - 断言 `editor.binary === null`、无 git、非仓库、无 origin 这四种降级各自发生时，列目录、读写、保存、删除、搜索与 `fm.watch` 的行为与改动前一致。覆盖 Correctness Property 7。
   - [ ] 12.3 同步 README 与 CHANGELOG
     - 另在「校验」一节写明 `verify-remote.mjs` 的 **Windows 覆盖缺口**：本功能的 Windows 分支（`cmd.exe` 剥引号 + `windowsVerbatimArguments` 那两层）**没有在真 Windows 上验证过**，只做了纯函数层面的往返断言；且假 `code.cmd` 用批处理 `echo` 记账对 `& | > < ^ %` 与换行是有损的，这些条目在 Windows 上会 SKIP。真机验证待补，别让读者以为 Windows 已经验过。
